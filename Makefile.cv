@@ -1,0 +1,99 @@
+# Do not compile *.c files!!
+# Pre-compiler and Compiler flags
+CXX_FLAGS :=  -std=c++14 -march=armv8-a -mcpu=cortex-a53 -O3
+PRE_FLAGS := 
+
+# Project directory structure
+BIN := ../
+SRC := .
+LIB := 
+INC := ../include /usr/include /usr/include/vio/
+MAINFILE := $(SRC)/TheOne.cpp
+
+# Build directories and output
+TARGET := $(BIN)/the1
+BUILD := ../buildcpp
+# Library search directories and flags
+EXT_LIB :=/usr/lib /usr/lib/hbbpu/
+
+# OpenCV related parameters (only for required files)
+OPENCV_LIBS := $(shell pkg-config --libs opencv4)
+OPENCV_FLAGS := $(shell pkg-config --cflags opencv4)
+# Link flags: Add OpenCV libs globally (no impact on compilation speed)
+LDFLAGS :=-ldnn -lpthread -lspcdev $(OPENCV_LIBS) -lX11
+LDPATHS := $(addprefix -L,$(LIB) $(EXT_LIB))
+
+# Basic include directories (without OpenCV)
+INC_DIRS := $(INC) $(shell find $(SRC) -type d) 
+BASE_INC_FLAGS := $(addprefix -I,$(INC_DIRS))
+# OpenCV include parameters (only for required files)
+OPENCV_INC_FLAGS := $(OPENCV_FLAGS)
+
+# Split source files into two groups
+# 1. OpenCV-dependent files: .cpp files starting with CV or T1CV
+CV_SRCS := $(shell find $(SRC) -name "CV*.cpp" -o -name "T1CV*.cpp")
+# 2. Normal files: Exclude CV/T1CV prefixed .cpp files
+NORMAL_SRCS := $(filter-out $(CV_SRCS), $(shell find $(SRC) -name "*.cpp"))
+
+# Convert to object file paths
+CV_OBJS := $(subst $(SRC)/,$(BUILD)/,$(addsuffix .o,$(basename $(CV_SRCS))))
+NORMAL_OBJS := $(subst $(SRC)/,$(BUILD)/,$(addsuffix .o,$(basename $(NORMAL_SRCS))))
+# Merge all object files
+OBJS := $(CV_OBJS) $(NORMAL_OBJS)
+# Dependency files
+DEPS := $(OBJS:.o=.d)
+
+# Dependency generation flags
+DEPFLAGS = -MT $@ -MMD -MP -MF $(BUILD)/$*.d
+
+# Build task
+build: all
+
+# Main task
+all: $(TARGET)
+
+# Link to generate executable (link all object files uniformly)
+$(TARGET): $(OBJS)
+	@echo "Linking target..."
+	$(CXX) $(CXX_FLAGS) $(OBJS) -o $@ $(LDPATHS) $(LDFLAGS)
+
+# Compilation rule: Normal files
+$(BUILD)/%.o: $(SRC)/%.cpp $(BUILD)/%.d
+	@if echo "$<" | grep -q -E "/(CV|T1CV)"; then \
+		:; \
+	else \
+		mkdir -p $(dir $@); \
+		echo "Compiling normal file: $<"; \
+		$(CXX) $(CXX_FLAGS) $(PRE_FLAGS) $(BASE_INC_FLAGS) $(DEPFLAGS) -c -o $@ $<; \
+	fi
+
+# Compilation rule: OpenCV-dependent files
+$(BUILD)/CV%.o: $(SRC)/CV%.cpp $(BUILD)/CV%.d
+	mkdir -p $(dir $@)
+	@echo "Compiling OpenCV file: $<"
+	$(CXX) $(CXX_FLAGS) $(PRE_FLAGS) $(BASE_INC_FLAGS) $(OPENCV_INC_FLAGS) $(DEPFLAGS) -c -o $@ $<
+
+$(BUILD)/T1CV%.o: $(SRC)/T1CV%.cpp $(BUILD)/T1CV%.d
+	mkdir -p $(dir $@)
+	@echo "Compiling OpenCV file: $<"
+	$(CXX) $(CXX_FLAGS) $(PRE_FLAGS) $(BASE_INC_FLAGS) $(OPENCV_INC_FLAGS) $(DEPFLAGS) -c -o $@ $<
+
+# Dependency file generation rule (split for normal/OpenCV files)
+$(BUILD)/%.d: $(SRC)/%.cpp
+	@mkdir -p $(dir $@)
+	@if echo "$<" | grep -q -E "/(CV|T1CV)"; then \
+		echo "Generating dep for OpenCV file: $<"; \
+		$(CXX) $(CXX_FLAGS) $(PRE_FLAGS) $(BASE_INC_FLAGS) $(OPENCV_INC_FLAGS) -MM -MT "$(BUILD)/$*.o $(BUILD)/$*.d" $< -o $@; \
+	else \
+		echo "Generating dep for normal file: $<"; \
+		$(CXX) $(CXX_FLAGS) $(PRE_FLAGS) $(BASE_INC_FLAGS) -MM -MT "$(BUILD)/$*.o $(BUILD)/$*.d" $< -o $@; \
+	fi
+
+# Clean task
+.PHONY: clean
+clean:
+	@echo "Clearing..."
+	rm -rf $(BUILD)
+
+# Include all dependencies
+-include $(DEPS)

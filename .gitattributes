@@ -1,0 +1,41 @@
+# 1. 核心规则：所有文本文件默认 LF（优先级最高）
+* text=auto eol=lf
+
+# 2. 明确标记特定文本文件（兜底，避免误判）
+/etc/default/isc-dhcp-server text eol=lf
+/etc/** text=auto eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.upt text -text=auto eol=lf  
+*.md text eol=lf
+*.txt text eol=lf
+*.ini text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# 3. 二进制文件（强制不转换，避免损坏）
+*.bin -text binary
+*.hex -text binary
+*.yuv -text binary
+*.avi -text binary
+*.zip -text binary
+*.7z -text binary
+*.rar -text binary
+# 你的可执行文件
+t1GetIsp -text binary
+t1Update -text binary
+the1 -text binary
+hihost -text binary
+Mower415.hex -text binary
+
+# 示例：所有 .md 文件用 CRLF（Windows 友好）
+*.md text eol=crlf
+
+# 示例：所有文本文件用 LF（跨平台统一）
+# * text=auto eol=lf
+
+# 示例：二进制文件不做任何转换
+*.png binary
+*.exe binary

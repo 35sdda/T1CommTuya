@@ -1,7 +1,7 @@
-# T1CommTuya
+# T1two
 
 #### Description
-{**When you're done, you can delete the content in this README and update the file with details for others getting started with your repository**}
+兼容ubantu下提交的X3C代码
 
 #### Software Architecture
 Software architecture description
