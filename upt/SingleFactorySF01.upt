@@ -1,8 +1,0 @@
-// comment
-
-// the diffrence of L/R wheels
-#WheelDiff 10 11
-
-// 0: normal,  1:test all night,  2:display time cost   8/9:special used by programmer
-#testnight 3
-

@@ -1,67 +1,60 @@
-# carefully! not compile *.c files!!
-# Pre-compiler and Compiler flags
-CXX_FLAGS :=  -std=c++14 -pthread -march=armv8-a -mcpu=cortex-a53 -O3
-PRE_FLAGS := 
+# Makefile for the1Comm（涂鸦通道版）
+#
+# 目录约定：**平铺** —— 所有 .cpp / .hpp / .md / .mk 与本文件同级，不分子目录。
+#
+# 相对原 demo app 的 Makefile 改了三处：
+#   A. TOOLCHAIN_SYSROOT 原版写死了原开发者的机器路径 /home/by/桌面/...，
+#      改成基于 ROOT_DIR，任何机器都能编。
+#   B. 本 app 含 .cpp，最终链接必须带 -lstdc++。
+#   C. 头文件搜索路径指向本目录自身（源文件之间 include 同目录的头文件）。
 
-# Project directory structure
-BIN := ../
-SRC := .
-LIB := 
-INC := ../include /usr/include /usr/include/vio/
-MAINFILE := $(SRC)/TheOne.cpp
+ROOT_DIR ?= $(abspath ../../)
+-include $(ROOT_DIR)/build/build_param
 
-# Build directories and output
-TARGET := $(BIN)/the1
-BUILD := ../buildcpp
-# Library search directories and flags
-EXT_LIB :=/usr/lib /usr/lib/hbbpu/
+# 编译所用变量
+OUTPUT_DIR = $(ROOT_DIR)/$(APP_PATH)/output/$(APP_NAME)_$(APP_VER)
 
-OPENCV_LIBS := $(shell pkg-config --libs opencv4)
-OPENCV_FLAGS := $(shell pkg-config --cflags opencv4)
-BLUETOOTH_LIBS := -lbluetooth
-LDFLAGS :=-ldnn -lpthread -lspcdev $(OPENCV_LIBS) -lX11 $(BLUETOOTH_LIBS)
-LDPATHS := $(addprefix -L,$(LIB) $(EXT_LIB))
+# 库文件路径
+TUYAOS_LIB_DIR = $(ROOT_DIR)/libs
 
-# Include directories
-INC_DIRS := $(INC) $(shell find $(SRC) -type d) 
-OPENCV_INCLUDES := $(shell pkg-config --cflags opencv4)
-INC_FLAGS := $(addprefix -I,$(INC_DIRS)) $(OPENCV_INCLUDES)
+# 头文件路径（改动 C：平铺，直接 -I 本目录）
+APP_CFLAGS = -I$(ROOT_DIR)/$(APP_PATH)
 
-# Construct build output and dependency filenames
-SRCS := $(shell find $(SRC) -name "*.cpp")
-OBJS := $(subst $(SRC)/,$(BUILD)/,$(addsuffix .o,$(basename $(SRCS))))
-DEPS := $(OBJS:.o=.d)
+# 链接选项
+LINKFLAGS = -L$(TUYAOS_LIB_DIR) \
+            -Xlinker "-(" \
+            -l$(APP_NAME) \
+            -ltuyaapp_components \
+            -ltuyaapp_drivers \
+            -ltuyaos \
+            -ltuyaos_adapter \
+            -Xlinker "-)" \
+            -pthread -lm
 
+# BlueZ / D-Bus 依赖的共享库（X3 板端需存在对应 .so）
+# 改动 A：改成基于 ROOT_DIR 的相对路径
+TOOLCHAIN_SYSROOT := $(ROOT_DIR)/vendor/aarch64-none-linux-gnu-gcc-11.2.1/toolchain/gcc-arm-11.2-2022.02-x86_64-aarch64-none-linux-gnu/aarch64-none-linux-gnu/libc
+LINKFLAGS += -L$(TOOLCHAIN_SYSROOT)/usr/lib/aarch64-linux-gnu
 
-# Dependency generation flags
-DEPFLAGS = -MT $@ -MMD -MP -MF $(BUILD)/$*.d
+# 用 --start-group/--end-group 避免库顺序问题
+LINKFLAGS += -Wl,--start-group \
+              -ldbus-1 -lbluetooth -lglib-2.0 -lgio-2.0 -lgmodule-2.0 -lgobject-2.0 \
+              -lpcre -lpcre2-8 -lmount -lblkid -luuid -lselinux -lffi -lz \
+              -lsystemd -llzma -llz4 -lzstd -lcap -lgcrypt -lgpg-error \
+              -Wl,--end-group
 
-# Build task
-build: all
+# 改动 B：本 app 的 .cpp 由 SDK 的 $(CXX) 编译，但下面这一行最终链接走的是 $(CC)。
+# 不带 libstdc++ 会报 undefined reference to std::__cxx11::basic_string 之类。
+# 放在最后，保证出现在所有库之后。
+LINKFLAGS += -lstdc++
 
-# Main task
-all: $(TARGET)
+all: app_excute
 
-# Task producing target from built files
-$(TARGET): $(OBJS)
-	@echo "Building..."
-	$(CXX) $(CXX_FLAGS) $(OBJS) -o $@ $(LDPATHS) $(LDFLAGS)
+app_excute:
+	@mkdir -p $(OUTPUT_DIR)
+	$(CC) $(LINKFLAGS) -o $(OUTPUT_DIR)/$(APP_NAME)
+	@echo "Build APP Finish"
 
-# Compile all cpp files
-$(BUILD)/%.o: $(SRC)/%.cpp $(BUILD)/%.d
-	mkdir -p $(dir $@)
-	$(CXX) $(CXX_FLAGS) $(PRE_FLAGS) $(INC_FLAGS) $(DEPFLAGS) -c -o $@ $< `pkg-config --cflags --libs opencv4`
-
-# Dependency file generation rule
-$(BUILD)/%.d: $(SRC)/%.cpp
-	@mkdir -p $(dir $@)
-	$(CXX) $(CXX_FLAGS) $(PRE_FLAGS) $(INC_FLAGS) -MM -MT "$(BUILD)/$*.o $(BUILD)/$*.d" $< -o $@
-
-# Clean task
-.PHONY: clean
+.PHONY: all clean app_excute
 clean:
-	@echo "Clearing..."
-	rm -rf $(BUILD)
-
-# Include all dependencies
--include $(DEPS)
+	rm -rf $(OUTPUT_DIR)
