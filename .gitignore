@@ -1,6 +1,10 @@
 # Build and Release Folders
-tuya\build
-tuya\output
+build/
+output/
+tuya/build/
+tuya/output/
+.gitattributes
+.gitignore
 
 # Other files and folders
 
