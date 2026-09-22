@@ -96,6 +96,31 @@ extern "C" {
  * /app partition, or a root owned directory) */
 #define T1_TUYA_FALLBACK_BASE   "/tmp/tuya_x3m/"
 
+/* ------------------------------------------------------------
+ * Store of the SDK: it keeps its device identity, wifi state and binding in a
+ * key/value store of three files.
+ *     tuya_user.db        main store
+ *     tuya_user.db_bak    last good copy of it, written by the SDK itself
+ *     tuya_enckey.db      key the store is encrypted with
+ * Header of a store, measured on the board:
+ *     offset  0.. 3   checksum, it changes with every write - NOT a magic number,
+ *                     do not test it (6c 23 61 ae on an empty store, b7 57 1d a3
+ *                     on a populated one; testing it rejects every healthy store)
+ *     offset  4.. 7   format version (2)
+ *     offset  8..11   number of records (8 on an empty store, 21 on a full one)
+ *     offset 12..15   size of the data area (0x1C70 = 28700 bytes)
+ *     offset 16..19   marker, always AA 55 AA 55 - the only field worth testing
+ * The numbers below were measured on the board: key 16 bytes, a healthy store
+ * 31236 bytes (35220 once the device is provisioned and bound).
+ * ------------------------------------------------------------ */
+#define T1_TUYA_KV_FILE         "tuya_user.db"
+#define T1_TUYA_KV_BAK_FILE     "tuya_user.db_bak"
+#define T1_TUYA_KV_KEY_FILE     "tuya_enckey.db"
+#define T1_TUYA_KV_KEY_BYTES    16              /* the key file is exactly this long */
+#define T1_TUYA_KV_MIN_BYTES    1024            /* below this a store is clearly truncated */
+#define T1_TUYA_KV_MARK_OFFS    16              /* offset of the marker */
+#define T1_TUYA_KV_MARK         "\xAA\x55\xAA\x55"  /* compared as bytes, no endian trap */
+
 static char s_storagePath[128] = T1_TUYA_STORAGE_PATH;
 static char s_logPath[128]     = T1_TUYA_LOG_PATH;
 
@@ -140,6 +165,132 @@ static int T1Tuya_EnsureDirWritable(const char *dir, mode_t mode)
         return -1;
     }
     return 0;
+}
+
+/* tell whether one store file looks like a store: present, not obviously truncated
+ * and carrying the marker at the offset it belongs to. Only the marker is tested;
+ * the first 4 bytes are a checksum that changes with every write
+ * path = full path of the file
+ * return:  true, the file looks like an intact store
+ * 2026.09.21: created by Lff（+AI）
+ * 2026.09.21: modified by Lff（+AI），magic test dropped (it is a checksum) and the
+ *             marker is compared as bytes to avoid the little endian trap
+ */
+static bool T1Tuya_KvLooksOk(const char *path)
+{
+    struct stat   st;
+    unsigned char head[20];
+    FILE         *fp=NULL;
+    bool          ok=false;
+
+    if ( path==NULL ) return false;
+    if ( stat(path, &st)!=0 ) return false;
+    if ( st.st_size<T1_TUYA_KV_MIN_BYTES ) return false;
+
+    fp=fopen(path, "rb");
+    if ( fp==NULL ) return false;
+    if ( fread(head, 1, sizeof(head), fp)==sizeof(head) ) {
+        if ( memcmp(head + T1_TUYA_KV_MARK_OFFS, T1_TUYA_KV_MARK, 4)==0 ) ok=true;
+    }
+    fclose(fp);
+    return ok;
+}
+
+/* decide what to do with the store on disk and act on it right away
+ * Has to run BEFORE the SDK opens the store (tuya_iot_init_params), that is why
+ * it sits in the middle of Init().
+ * The store is only ever touched when it is OBVIOUSLY not a store. Judging a
+ * usable store as broken costs the binding, the grid map and the logs and sends
+ * somebody out to re-provision; judging a broken one as usable costs nothing but
+ * one more netcfg run. On top of that the SDK builds a fresh store and resets its
+ * gateway state by itself when it cannot read one (measured: it logs "enter reset
+ * factory"), so wiping is not a favour it needs from us.
+ * The messages below use printf on purpose: this function runs BEFORE
+ * tuya_iot_init_params(), where the SDK log backend is not up yet and TAL_PR_*
+ * output is silently dropped - the same reason the other pre-init messages in
+ * Init() use printf as well.
+ * return:  1, store usable (possibly restored from the backup);
+ *           0, the files were not a store at all and were removed, the SDK builds
+ *              a fresh one and the device has to be provisioned again;
+ *          -1, nothing to do (fresh device), or not recoverable but left alone
+ * 2026.09.21: created by Lff（+AI）
+ * 2026.09.21: modified by Lff（+AI）, only files that obviously are not a store are
+ *             touched, a doubtful store is always left alone
+ */
+static int T1Tuya_KvStoreCheck(void)
+{
+    char        db_path[192];
+    char        bak_path[192];
+    char        key_path[192];
+    struct stat st;
+    long long   key_size=0;
+    long long   db_size=0;
+    bool        key_here=false;
+    bool        key_ok=false;
+    bool        db_here=false;
+    bool        bak_here=false;
+    bool        db_ok=false;
+    bool        bak_ok=false;
+
+    snprintf(db_path,  sizeof(db_path),  "%s%s", s_storagePath, T1_TUYA_KV_FILE);
+    snprintf(bak_path, sizeof(bak_path), "%s%s", s_storagePath, T1_TUYA_KV_BAK_FILE);
+    snprintf(key_path, sizeof(key_path), "%s%s", s_storagePath, T1_TUYA_KV_KEY_FILE);
+
+    key_here=(stat(key_path, &st)==0);
+    key_size=key_here ? (long long)st.st_size : 0;
+    key_ok  =(key_here && key_size==T1_TUYA_KV_KEY_BYTES);
+    db_here =(access(db_path,  F_OK)==0);
+    bak_here=(access(bak_path, F_OK)==0);
+    db_ok   =T1Tuya_KvLooksOk(db_path);
+    bak_ok  =T1Tuya_KvLooksOk(bak_path);
+    db_size =0;
+    if ( db_here && stat(db_path, &st)==0 ) db_size=(long long)st.st_size;
+
+    /* no store file at all: a fresh device, the SDK creates everything. A left
+     * over key file is harmless and is left where it is. */
+    if ( !db_here && !bak_here ) {
+        printf("T1Tuya-KvCheck: no store yet, a fresh one will be created\n");
+        return -1;
+    }
+
+    /* the normal case: the store is there and looks like a store - hands off */
+    if ( db_ok ) {
+        printf("T1Tuya-KvCheck: store ok, reuse it\n");
+        return 1;
+    }
+
+    printf("T1Tuya-KvCheck: main store does not look like a store (size=%lld, key %s)\n",
+           db_size, key_ok ? "ok" : "not ok");
+
+    /* second chance: the backup the SDK keeps next to the store. It only helps
+     * when the key itself is fine. */
+    if ( key_ok && bak_ok ) {
+        unlink(db_path);
+        if ( rename(bak_path, db_path)==0 ) {
+            printf("T1Tuya-KvCheck: restored the store from the backup, reuse it\n");
+            return 1;
+        }
+        printf("T1Tuya-KvCheck: restore from the backup failed: %s, left as is\n",
+               strerror(errno));
+        return -1;
+    }
+
+    /* Only a file that can not hold a store at all is removed: a healthy store
+     * measures tens of kilobytes, so anything below the minimum is truncated
+     * rubbish and no data can be lost by removing it. A large file that merely
+     * lacks our marker could still be a store of an unknown layout, so it is left
+     * alone - losing the binding, the grid map and the logs, and sending somebody
+     * out to re-provision, costs far more than one more netcfg run. */
+    if ( db_here && db_size<T1_TUYA_KV_MIN_BYTES ) {
+        printf("T1Tuya-KvCheck: store is truncated rubbish, wiped -> provisioning needed again\n");
+        unlink(db_path);
+        unlink(bak_path);
+        unlink(key_path);
+        return 0;
+    }
+
+    printf("T1Tuya-KvCheck: store not recoverable but left untouched on purpose\n");
+    return -1;
 }
 
 /* ------------------------------------------------------------
@@ -807,20 +958,85 @@ static OPERATE_RET __set_auth_info(void)
     return rt;
 }
 
-/* force the gateway work state back to "unregistered / not configured",
- * otherwise the SDK would never open the BLE netcfg service again on boot
+/* settle the netcfg state of this boot: keep a usable store, reset what is not
+ * usable any more to "unregistered / not configured" (the state that makes the
+ * SDK open the BLE netcfg service again).
+ * The reset is deliberately NOT unconditional: forcing it on every boot pushes
+ * the device back into netcfg, where the SDK re-activates the wifi profile over
+ * and over (measured: 6 drop/connect pairs within one boot). A cloud activation
+ * request that lands inside such a drop fails with "fail to get cloud url -2050"
+ * and then "activate timeout", so the device stays offline although wlan0 is
+ * connected and the App reports "device not found".
+ * wsm    = gateway work state from the store: netcfg mode, ssid, passwd, stat
+ * bi     = device identity from the store, it carries ap_ssid/ap_passwd as well
+ * stat   = UNREGISTERED 0 / REGISTERED 1 / ACTIVATED 2              (gw_intf.h)
+ * nc_tp  = GWNS_*: 1/2/10 are still waiting for credentials, 3/4/5/6/7/9/12
+ *          already received them                        (tuya_cloud_wifi_defs.h)
+ * Force a re-provisioning (new router, changed password, device bound by someone
+ * else) by wiping the store and rebooting; the device is then unbound and has to
+ * be added in the App again:
+ *     sudo rm -f /app/TheOne/tuya_x3m/tuya_user.db* /app/TheOne/tuya_x3m/tuya_enckey.db
+ * return:  1, state was reset and written;   0, kept as is (usable store);
+ *          -1, a reset was needed but the write failed
  * 2026.09.20: created by Lff（+AI）, add function header comment
+ * 2026.09.21: modified by Lff（+AI）, reuse a usable store, repair a state that
+ *             lost its credentials, reset only what is really not provisioned
  */
-static void __force_unregistered_wsm(void)
+static int __force_unregistered_wsm(void)
 {
     GW_WORK_STAT_MAG_S wsm;
-    OPERATE_RET rt=OPRT_OK;
+    GW_BASE_IF_S       bi;
+    OPERATE_RET rt_wsm=OPRT_OK;
+    OPERATE_RET rt_bi=OPRT_OK;
+    bool identity_ok=false;
+    bool cred_ok=false;
+    bool provisioned=false;
 
     memset(&wsm, 0, sizeof(wsm));
-    rt=wd_gw_wsm_read(&wsm);
-    if ( rt!=OPRT_OK ) {
-        TAL_PR_WARN("T1Tuya-ForceWsm: read failed: %d, use default", rt);
+    rt_wsm=wd_gw_wsm_read(&wsm);
+    if ( rt_wsm!=OPRT_OK ) {
+        /* no work state stored yet: a fresh store, treat it as unprovisioned */
+        TAL_PR_WARN("T1Tuya-ForceWsm: wsm read failed: %d, treat as unprovisioned", rt_wsm);
+        memset(&wsm, 0, sizeof(wsm));
     }
+
+    memset(&bi, 0, sizeof(bi));
+    rt_bi=wd_gw_base_if_read(&bi);
+    identity_ok=(rt_bi==OPRT_OK && bi.uuid[0]!='\0' && bi.auth_key[0]!='\0');
+
+    /* credentials can sit in the identity record and/or in the work state */
+    cred_ok=(bi.ap_ssid[0]!='\0') || (wsm.ssid[0]!='\0');
+
+    /* the GWNS_* values that mean "credentials already received", plus
+     * NO_NEED_CFG (wifi does not have to be configured again) */
+    provisioned=(wsm.stat!=UNREGISTERED) ||
+                (wsm.nc_tp==GWNS_TY_SMARTCFG)    || (wsm.nc_tp==GWNS_TY_AP) ||
+                (wsm.nc_tp==GWNS_WECHAT_AK)      || (wsm.nc_tp==GWNS_OTHER_CFG) ||
+                (wsm.nc_tp==GWNS_NO_NEED_CFG)    || (wsm.nc_tp==GWNS_TY_SMART_AP_CFG) ||
+                (wsm.nc_tp==GWNS_PROXY_CONFIG_WF);
+
+    if ( identity_ok && cred_ok && provisioned ) {
+        TAL_PR_NOTICE("T1Tuya-ForceWsm: usable store, keep it (stat=%d nc_tp=%d ssid=%s)",
+                      wsm.stat, wsm.nc_tp, wsm.ssid[0]!='\0' ? wsm.ssid : bi.ap_ssid);
+        return 0;
+    }
+
+    /* credentials are there but the work state lost them (for example a store
+     * that was written halfway): repair the state from the identity record
+     * instead of asking for a new provisioning run */
+    if ( identity_ok && cred_ok ) {
+        snprintf(wsm.ssid,   sizeof(wsm.ssid),   "%s", bi.ap_ssid);
+        snprintf(wsm.passwd, sizeof(wsm.passwd), "%s", bi.ap_passwd);
+        wsm.nc_tp=GWNS_NO_NEED_CFG;
+        wsm.md=GWM_NORMAL;
+        wsm.stat=REGISTERED;
+        rt_wsm=wd_gw_wsm_write(&wsm);
+        TAL_PR_NOTICE("T1Tuya-ForceWsm: state repaired from the identity record, write ret=%d", rt_wsm);
+        if ( rt_wsm==OPRT_OK ) return 0;
+    }
+
+    TAL_PR_NOTICE("T1Tuya-ForceWsm: reset to unprovisioned (identity=%d cred=%d stat=%d nc_tp=%d)",
+                  identity_ok ? 1 : 0, cred_ok ? 1 : 0, wsm.stat, wsm.nc_tp);
 
     wsm.nc_tp=GWNS_UNCFG_SMC;
     wsm.md=GWM_SPECIAL_SMT_CFG;
@@ -828,8 +1044,10 @@ static void __force_unregistered_wsm(void)
     memset(wsm.ssid,   0, sizeof(wsm.ssid));
     memset(wsm.passwd, 0, sizeof(wsm.passwd));
 
-    rt=wd_gw_wsm_write(&wsm);
-    TAL_PR_NOTICE("T1Tuya-ForceWsm: write ret=%d stat=%d", rt, wsm.stat);
+    rt_wsm=wd_gw_wsm_write(&wsm);
+    TAL_PR_NOTICE("T1Tuya-ForceWsm: write ret=%d stat=%d", rt_wsm, wsm.stat);
+
+    return (rt_wsm==OPRT_OK) ? 1 : -1;
 }
 
 /* ============================================================
@@ -1120,6 +1338,12 @@ int T1Tuya::Init()
     /* 5. base services of the SDK: KV database, logs, system layer. This is
      *    the foundation of everything below and the step that fails first when
      *    the storage path is not writable. */
+    /* 5a. store health check - MUST run before the SDK opens the store below:
+     *     complete store -> reused as is; broken -> restored from the SDK backup;
+     *     beyond repair -> wiped, a fresh store is built and the device has to be
+     *     provisioned again. */
+    T1Tuya_KvStoreCheck();
+
     TY_INIT_PARAMS_S init_param;
     memset(&init_param, 0, sizeof(init_param));
     init_param.init_db=TRUE;
@@ -1163,10 +1387,12 @@ int T1Tuya::Init()
                iot_cbs.gw_ug_cb, iot_cbs.dev_ug_cb, iot_cbs.pre_dev_ug_cb);
     }
 
-    /* 9. force "unregistered / not configured". Without it a leftover state in
-     *    the KV database stops the SDK from ever opening the BLE netcfg
-     *    service again, and a wlan0 connection made by hand (nmcli) would count
-     *    as "already configured". */
+    /* 9. netcfg state: a usable store keeps its ssid/passwd so the device goes
+     *    straight to the cloud link, only what is not usable any more is reset
+     *    to "unregistered / not configured" (which is what opens the BLE netcfg
+     *    service again). Force a re-provisioning by wiping the store, then
+     *    reboot; the device has to be added in the App again afterwards:
+     *        sudo rm -f /app/TheOne/tuya_x3m/tuya_user.db* /app/TheOne/tuya_x3m/tuya_enckey.db */
     __force_unregistered_wsm();
 
     /* 10. persist the netcfg start mode so that the next boot does not depend
