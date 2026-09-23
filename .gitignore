@@ -5,7 +5,7 @@ tuya/build/
 tuya/output/
 .gitattributes
 .gitignore
-
+TheOne.sh
 # Other files and folders
 
 # Executables

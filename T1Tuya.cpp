@@ -3,8 +3,8 @@
  *
  * The cloud side of the mower. Two directions, both exit/enter here:
  *   cloud  -> device : the SDK calls __dev_obj_dp_cb() / __dev_raw_dp_cb(),
- *                      T1Tuya_OnObjDp() / T1Tuya_OnMoveDir() translate the
- *                      value into a "$C:xx" frame and hand it to the1Act.
+ *                      T1Tuya_OnObjDp() / T1Tuya_OnRawDp() translate the
+ *                      value into a device command and hand it to the1Act.
  *   device -> cloud  : the event loop feeds every frame produced by the1 or
  *                      the1Act into T1Tuya::SendData(). The heart beat frame
  *                      carries the mower status in its "S:" field -> DP113.
@@ -16,7 +16,7 @@
  *
  * 2026.09.20: created by Lff（+AI）
  * 2026.09.21: modified by Lff（+AI）, absorb T1DpMap/T1DevOut into this file,
- *             add DP113 report and DP121 move direction
+ *             add DP113 report and DP117 raw remote control
  * ============================================================ */
 
 #include "T1Tuya.hpp"
@@ -51,7 +51,9 @@ extern "C" {
 #include "tal_system.h"
 #include "tal_log.h"
 #include "tuya_error_code.h"
+#include "tuya_ipc_stream_storage.h"
 #include "tuya_svc_upgrade.h"
+#include "ty_rlm_func.h"
 #include "ws_db_gw.h"
 }
 
@@ -436,8 +438,9 @@ static int T1Tuya_SendToDevice(const char *frame)
 #define DP_ID_ERROR_LOG         111     /* error log, raw 20 x 7 bytes, report only */
 #define DP_ID_WORK_LOG          112     /* work log, raw 10 entries, report only */
 #define DP_ID_DEVICE_STATUS     113     /* device status, value 0 idle/1 out/2 back/3 mowing/4 pause, report only */
-#define DP_ID_LAWN_PROGRESS     114     /* lawn coverage progress, raw grid map, report only */
-#define DP_ID_MOVE_DIR          121     /* move direction, value 0 stop/1 fwd/2 back/3 left/4 right, rw */
+#define DP_ID_MOW_DIRECTION     114     /* mowing direction settings, raw 4 bytes, rw */
+#define DP_ID_REMOTE_CONTROL    117     /* remote control bitmap, raw 1 byte, rw */
+#define DP_ID_WORK_SPEED        120     /* work speed, value 0-5, 1-4 currently valid */
 #define DP_ID_ERROR_REPORT_V2   150     /* error report v2, raw 10 x 8 bytes, pushed in real time */
 
 /* Same values as the SDK PROP_xxx (tuya_cloud_com_defs.h:258-262) */
@@ -467,8 +470,9 @@ static const T1DpDesc s_dpTable[] = {
     { DP_ID_ERROR_LOG,       DP_KIND_RAW,   0, "error log"           },
     { DP_ID_WORK_LOG,        DP_KIND_RAW,   0, "work log"            },
     { DP_ID_DEVICE_STATUS,   DP_KIND_VALUE, 0, "device status"       },
-    { DP_ID_LAWN_PROGRESS,   DP_KIND_RAW,   0, "lawn progress"       },
-    { DP_ID_MOVE_DIR,        DP_KIND_VALUE, 1, "move direction"      },
+    { DP_ID_MOW_DIRECTION,   DP_KIND_RAW,   1, "mow direction"       },
+    { DP_ID_REMOTE_CONTROL,  DP_KIND_RAW,   1, "remote control"      },
+    { DP_ID_WORK_SPEED,      DP_KIND_VALUE, 1, "work speed"          },
     { DP_ID_ERROR_REPORT_V2, DP_KIND_RAW,   0, "error report v2"     },
 };
 
@@ -512,6 +516,7 @@ static void T1Tuya_DumpDpTable(void)
  * kind  = DP_KIND_BOOL / DP_KIND_VALUE (the SDK PROP_BOOL / PROP_VALUE)
  * value = bool as 0/1, value as integer
  * return:  0, handled or explicitly ignored;   -1, unknown dpid
+ * 2026.09.23: modified by Lff（+AI）, execute DP107 and forward DP120
  * 2026.09.21: moved from T1DpMap.cpp by Lff（+AI）
  */
 static int T1Tuya_OnObjDp(unsigned char dpid, int kind, int value)
@@ -564,7 +569,6 @@ static int T1Tuya_OnObjDp(unsigned char dpid, int kind, int value)
     case DP_ID_RAIN_RESUME:
     case DP_ID_RAIN_DELAY:
     case DP_ID_EDGE_DISTANCE:
-    case DP_ID_RANDOM_MOW:
     case DP_ID_HEDGEHOG_GUARD:
     case DP_ID_RANDOM_MODE:
         /* TODO: these write a configuration item, mapping it to a device
@@ -576,6 +580,22 @@ static int T1Tuya_OnObjDp(unsigned char dpid, int kind, int value)
         }
         break;
 
+    case DP_ID_RANDOM_MOW:
+        snprintf(frame, sizeof(frame), "$C:%c\r\n", value ? '3' : '0');
+        if ( T1Tuya_SendToDevice(frame)!=0 ) return -1;
+        return T1Tuya_ReportDpBool(DP_ID_RANDOM_MOW, value ? 1 : 0);
+
+    case DP_ID_WORK_SPEED:
+        if ( value<0 || value>5 ) {
+            if ( debug>0 ) {
+                printf("T1Tuya-OnObjDp: dpid=%u invalid work speed=%d\n", dpid, value);
+            }
+            return -1;
+        }
+        snprintf(frame, sizeof(frame), "$X:WORK_SPEED,%d\r\n", value);
+        if ( T1Tuya_SendToDevice(frame)!=0 ) return -1;
+        return T1Tuya_ReportDpValue(DP_ID_WORK_SPEED, value);
+
     default:
         if ( debug>0 ) printf("T1Tuya-OnObjDp: unknown dpid=%u, ignore\n", dpid);
         return -1;
@@ -584,33 +604,309 @@ static int T1Tuya_OnObjDp(unsigned char dpid, int kind, int value)
     return 0;
 }
 
-/* cloud -> device: handle one raw DP, mainly the map pushed back from the App
- * dpid = function point id, data = payload, len = byte count
- * return:  0, handled or explicitly ignored;   -1, invalid input
+static int T1Tuya_OnMoveDir(int dir);
+
+/* validate and echo one DP114 mowing direction setting
+ * data = 4 bytes: mode, primary angle, secondary angle and rotation step
+ * len = payload byte count, must be 4
+ * return:  0, reported;   -1, invalid payload or report failed
+ * 2026.09.23: created by Lff（+AI）
+ */
+static int T1Tuya_OnMowDirectionRaw(const unsigned char *data, unsigned len)
+{
+    int debug=1;
+    int direction=0;
+    int angle1=0;
+    int angle2=0;
+    int rotation_step=0;
+    int valid=1;
+
+    if ( !data || len!=4 ) {
+        if ( debug>1 ) printf("T1Tuya-OnMowDirectionRaw: invalid len=%u\n", len);
+        return -1;
+    }
+
+    direction=data[0];
+    angle1=(signed char)data[1];
+    angle2=(signed char)data[2];
+    rotation_step=data[3];
+
+    if ( direction<0 || direction>2 ) valid=0;
+    if ( angle1<-90 || angle1>90 || angle1%5!=0 ) valid=0;
+
+    switch ( direction ) {
+    case 0:
+        if ( angle2!=0 || rotation_step!=0 ) valid=0;
+        break;
+    case 1:
+        if ( angle2<-90 || angle2>90 || angle2%5!=0 || rotation_step!=0 ) valid=0;
+        break;
+    case 2:
+        if ( angle2!=0 || rotation_step<1 || rotation_step>90 ) valid=0;
+        break;
+    default:
+        valid=0;
+        break;
+    }
+
+    if ( !valid ) {
+        if ( debug>1 ) {
+            printf("T1Tuya-OnMowDirectionRaw: invalid direction=%d angle1=%d angle2=%d step=%d\n",
+                   direction, angle1, angle2, rotation_step);
+        }
+        return -1;
+    }
+
+    if ( debug>1 ) {
+        printf("T1Tuya-OnMowDirectionRaw: direction=%d angle1=%d angle2=%d step=%d\n",
+               direction, angle1, angle2, rotation_step);
+    }
+    return T1Tuya_ReportDpRaw(DP_ID_MOW_DIRECTION, data, len);
+}
+
+/* execute and echo one DP117 remote control bitmap
+ * data = one bitmap byte: bit0 forward, bit1 backward, bit2 left, bit3 right
+ * len = payload byte count, must be 1
+ * return:  0, command queued and state reported;   -1, invalid input or send failed
+ * 2026.09.23: created by Lff（+AI）
+ */
+static int T1Tuya_OnRemoteControlRaw(const unsigned char *data, unsigned len)
+{
+    int debug=1;
+    int dir=0;
+    int valid=1;
+    unsigned char applied=0;
+
+    if ( !data || len!=1 ) {
+        if ( debug>1 ) printf("T1Tuya-OnRemoteControlRaw: invalid len=%u\n", len);
+        return -1;
+    }
+
+    switch ( data[0] ) {
+    case 0x00: dir=0; applied=0x00; break;
+    case 0x01: dir=1; applied=0x01; break;
+    case 0x02: dir=2; applied=0x02; break;
+    case 0x04: dir=3; applied=0x04; break;
+    case 0x08: dir=4; applied=0x08; break;
+    default:
+        dir=0;
+        applied=0x00;
+        valid=0;
+        break;
+    }
+
+    if ( debug>1 ) {
+        printf("T1Tuya-OnRemoteControlRaw: request=0x%02X applied=0x%02X valid=%d\n",
+               data[0], applied, valid);
+    }
+    if ( T1Tuya_OnMoveDir(dir)!=0 ) return -1;
+
+    return T1Tuya_ReportDpRaw(DP_ID_REMOTE_CONTROL, &applied, 1);
+}
+
+/* dispatch one raw DP from the cloud
+ * dpid = function point id
+ * data = raw payload owned by the SDK
+ * len = payload byte count
+ * return:  0, handled;   -1, invalid or unsupported payload
  * 2026.09.21: moved from T1DpMap.cpp by Lff（+AI）
+ * 2026.09.23: modified by Lff（+AI）, handle DP114 and DP117
  */
 static int T1Tuya_OnRawDp(unsigned char dpid, const unsigned char *data, unsigned len)
 {
     int debug=1;
 
-    if ( data==NULL || len==0 ) return -1;
+    if ( !data || len==0 ) return -1;
 
-    if ( debug>0 ) printf("T1Tuya-OnRawDp: dpid=%u len=%u\n", dpid, len);
+    if ( debug>1 ) printf("T1Tuya-OnRawDp: dpid=%u len=%u\n", dpid, len);
 
     switch ( dpid ) {
-    case DP_ID_LAWN_PROGRESS:
-        /* 114 is report only, a downlink is not expected */
-        if ( debug>0 ) printf("T1Tuya-OnRawDp: dpid=%u is report-only, ignore\n", dpid);
-        break;
+    case DP_ID_MOW_DIRECTION:
+        return T1Tuya_OnMowDirectionRaw(data, len);
+    case DP_ID_REMOTE_CONTROL:
+        return T1Tuya_OnRemoteControlRaw(data, len);
+    default:
+        if ( debug>1 ) printf("T1Tuya-OnRawDp: dpid=%u unsupported\n", dpid);
+        return -1;
+    }
+}
+
+/* report that local SD storage is unavailable
+ * return:  SD_STATUS_NOT_EXIST, no SD card is provided by this application
+ * 2026.09.23: created by Lff（+AI）
+ */
+SD_STATUS_E tuya_ipc_sd_get_status(VOID)
+{
+    return SD_STATUS_NOT_EXIST;
+}
+
+/* report zero capacity because local SD storage is disabled
+ * p_total = output pointer for total capacity
+ * p_used = output pointer for used capacity
+ * p_free = output pointer for free capacity
+ * 2026.09.23: created by Lff（+AI）
+ */
+VOID tuya_ipc_sd_get_capacity(UINT_T *p_total, UINT_T *p_used, UINT_T *p_free)
+{
+    if ( p_total ) {
+        *p_total=0;
+    }
+    if ( p_used ) {
+        *p_used=0;
+    }
+    if ( p_free ) {
+        *p_free=0;
+    }
+}
+
+/* ignore an SD remount request because local SD storage is disabled
+ * 2026.09.23: created by Lff（+AI）
+ */
+VOID tuya_ipc_sd_remount(VOID)
+{
+}
+
+/* provide a valid placeholder path required by the IPC storage component
+ * return:  writable placeholder path used when storage is not enabled
+ * 2026.09.23: created by Lff（+AI）
+ */
+CHAR_T *tuya_ipc_get_sd_mount_path(VOID)
+{
+    static CHAR_T mount_path[]="/tmp";
+
+    return mount_path;
+}
+
+/* disable all IPC stream writes to local storage
+ * return:  SS_WRITE_MODE_NONE, do not write recordings
+ * 2026.09.23: created by Lff（+AI）
+ */
+STREAM_STORAGE_WRITE_MODE_E tuya_ipc_sd_get_mode_config(VOID)
+{
+    return SS_WRITE_MODE_NONE;
+}
+
+/* send one RLM control command to the mower through the existing App frame path
+ * command = command character understood by TheOne, such as '3', 'h' or '0'
+ * return:  0, queued;   -1, downstream not ready or queue full
+ * 2026.09.23: created by Lff（+AI）
+ */
+static int T1Tuya_SendRlmCommand(char command)
+{
+    char frame[16]={0};
+
+    snprintf(frame, sizeof(frame), "$C:%c\r\n", command);
+    return T1Tuya_SendToDevice(frame);
+}
+
+/* handle one immediate mowing request and reply with its queueing result
+ * request = mowing switch, mode and selected area information decoded by RLM SDK
+ * return:  OPRT_OK, response accepted;   other value, response failed
+ * 2026.09.23: created by Lff（+AI）
+ */
+static OPERATE_RET T1Tuya_HandleRlmMowing(const RLM_IMMEDIATE_MOWING_TASK_S *request)
+{
+    int debug=1;
+    int send_ret=-1;
+    RLM_IMMEDIATE_MOWING_TASK_R response={0};
+
+    if ( !request ) return OPRT_INVALID_PARM;
+
+    if ( debug>1 ) {
+        printf("T1Tuya-HandleRlmMowing: go=%d mode=%d area_num=%d\n",
+               request->ctrl_switch_go, request->mow_mode, request->area_num);
+    }
+
+    send_ret=T1Tuya_SendRlmCommand(request->ctrl_switch_go ? '3' : '0');
+
+    response.ctrl_switch_go=request->ctrl_switch_go;
+    response.mow_mode=request->mow_mode;
+    response.area_num=request->area_num;
+    response.area_id=request->area_id;
+    response.code_error.success=(send_ret==0);
+    response.code_error.code=(send_ret==0) ? 0 : 3001;
+
+    if ( debug>0 ) {
+        printf("T1Tuya-HandleRlmMowing: finish, send_ret=%d\n", send_ret);
+    }
+    return ty_rlm_immediate_mowing_task_response(&response);
+}
+
+/* handle one immediate charging request and reply with its queueing result
+ * request = charging switch decoded by RLM SDK
+ * return:  OPRT_OK, response accepted;   other value, response failed
+ * 2026.09.23: created by Lff（+AI）
+ */
+static OPERATE_RET T1Tuya_HandleRlmCharge(const RLM_IMMEDIATE_CHARGE_TASK_S *request)
+{
+    int debug=1;
+    int send_ret=-1;
+    RLM_IMMEDIATE_CHARGE_TASK_R response={0};
+
+    if ( !request ) return OPRT_INVALID_PARM;
+
+    if ( debug>1 ) {
+        printf("T1Tuya-HandleRlmCharge: charge=%d\n", request->ctrl_switch_charge);
+    }
+
+    send_ret=T1Tuya_SendRlmCommand(request->ctrl_switch_charge ? 'h' : '0');
+
+    response.ctrl_switch_charge=request->ctrl_switch_charge;
+    response.code_error.success=(send_ret==0);
+    response.code_error.code=(send_ret==0) ? 0 : 3001;
+
+    if ( debug>0 ) {
+        printf("T1Tuya-HandleRlmCharge: finish, send_ret=%d\n", send_ret);
+    }
+    return ty_rlm_immediate_charge_task_response(&response);
+}
+
+/* dispatch one RLM setting request decoded by the Tuya SDK
+ * command = RLM command type used to select the parameter structure
+ * parameter = command-specific request structure owned by the SDK
+ * return:  OPRT_OK, handled or ignored;   other value, handling failed
+ * 2026.09.23: created by Lff（+AI）
+ */
+static OPERATE_RET T1Tuya_RlmSetCallback(COMPLEX_RLM_CMD_E command, void *parameter)
+{
+    int debug=1;
+
+    if ( !parameter ) return OPRT_INVALID_PARM;
+
+    switch ( command ) {
+    case IMMEDIATE_MOWING_TASK_REQUEST:
+        return T1Tuya_HandleRlmMowing(
+                static_cast<RLM_IMMEDIATE_MOWING_TASK_S *>(parameter));
+
+    case IMMEDIATE_CHARGE_TASK_REQUEST:
+        return T1Tuya_HandleRlmCharge(
+                static_cast<RLM_IMMEDIATE_CHARGE_TASK_S *>(parameter));
 
     default:
-        /* TODO: which DP carries a map push and in which binary format has to
-         * be aligned with the App side, for now it is only logged */
-        if ( debug>0 ) printf("T1Tuya-OnRawDp: dpid=%u unhandled TODO\n", dpid);
+        if ( debug>1 ) {
+            printf("T1Tuya-RlmSetCallback: unsupported command=%d\n", command);
+        }
         break;
     }
 
-    return 0;
+    return OPRT_OK;
+}
+
+/* log one RLM query until a query-response feature is implemented
+ * command = RLM query command type
+ * parameter = command-specific query structure owned by the SDK
+ * return:  OPRT_OK, query received and intentionally ignored
+ * 2026.09.23: created by Lff（+AI）
+ */
+static OPERATE_RET T1Tuya_RlmQueryCallback(COMPLEX_RLM_CMD_E command, void *parameter)
+{
+    int debug=1;
+
+    (void)parameter;
+    if ( debug>1 ) {
+        printf("T1Tuya-RlmQueryCallback: unsupported command=%d\n", command);
+    }
+    return OPRT_OK;
 }
 
 /* ------------------------------------------------------------
@@ -658,7 +954,7 @@ static VOID_T __wf_cfg_err_code_cb(IN CONST NW_CFG_ERR_CODE_E err_code)
 }
 
 /* ============================================================
- * DP121 - move direction (cloud -> device)
+ * DP117 - remote control direction output (cloud -> device)
  *
  * The value is translated into the same "$C:xx" frame that the 1111 socket and
  * the BLE SPP of the1Comm use, so the device side needs no change at all.
@@ -667,13 +963,13 @@ static VOID_T __wf_cfg_err_code_cb(IN CONST NW_CFG_ERR_CODE_E err_code)
 /* action characters understood by the mower, they are the ones of the "$C:"
  * frame: TheOne takes bufRecv[3] and turns it into "@CMD,%c\r\n" for the F415
  * board, so the action has to be the 4th byte of the frame. */
-#define T1_TUYA_MOVE_STOP       'g'     /* DP121 = 0, stop */
-#define T1_TUYA_MOVE_FORWARD    'w'     /* DP121 = 1, forward */
-#define T1_TUYA_MOVE_BACKWARD   's'     /* DP121 = 2, backward */
-#define T1_TUYA_MOVE_LEFT       'a'     /* DP121 = 3, turn left */
-#define T1_TUYA_MOVE_RIGHT      'd'     /* DP121 = 4, turn right */
+#define T1_TUYA_MOVE_STOP       'g'     /* DP117 = 0x00, stop */
+#define T1_TUYA_MOVE_FORWARD    'w'     /* DP117 bit 0, forward */
+#define T1_TUYA_MOVE_BACKWARD   's'     /* DP117 bit 1, backward */
+#define T1_TUYA_MOVE_LEFT       'a'     /* DP117 bit 2, turn left */
+#define T1_TUYA_MOVE_RIGHT      'd'     /* DP117 bit 3, turn right */
 
-/* translate DP121 and push it down to the mower
+/* translate one remote direction and push it down to the mower
  * dir = direction value: 0 stop / 1 forward / 2 backward / 3 left / 4 right
  * return:  0, queued;   -1, downstream not ready or queue full
  * Three conventions worth knowing:
@@ -1198,7 +1494,6 @@ T1Tuya::~T1Tuya()
  * dp = TY_RECV_OBJ_DP_S, dp->dps[] holds one entry per DP of this downlink
  * return: none, the internal handlers own the per DP result
  * 2026.09.20: created by Lff（+AI）, add function header comment
- * 2026.09.21: modified by Lff（+AI）, intercept DP121 before the DP table
  */
 static VOID_T __dev_obj_dp_cb(IN CONST TY_RECV_OBJ_DP_S *dp)
 {
@@ -1221,14 +1516,6 @@ static VOID_T __dev_obj_dp_cb(IN CONST TY_RECV_OBJ_DP_S *dp)
 
         if ( debug>0 ) {
             printf("T1Tuya-OnObjDp: dpid=%u type=%d value=%d\n", one->dpid, one->type, value);
-        }
-
-        /* DP121 is the downlink of the channel itself (direction -> "$C:"),
-         * it is handled here instead of in the DP table, the DP table covers
-         * the parameter DPs of the requirement document */
-        if ( one->dpid==DP_ID_MOVE_DIR ) {
-            T1Tuya_OnMoveDir(value);
-            continue;
         }
 
         T1Tuya_OnObjDp(one->dpid, one->type, value);
@@ -1363,6 +1650,15 @@ int T1Tuya::Init()
     if ( __set_auth_info()!=OPRT_OK ) {
         TAL_PR_WARN("T1Tuya-Init: set auth info failed, continue anyway");
     }
+
+    /* 6a. register the two first RLM control requests before the cloud link
+     *     starts delivering complex protocol data */
+    rt=ty_rlm_complex_func_register(T1Tuya_RlmSetCallback, T1Tuya_RlmQueryCallback);
+    if ( rt!=OPRT_OK ) {
+        TAL_PR_ERR("T1Tuya-Init: RLM callback register failed: %d", rt);
+        return -1;
+    }
+    TAL_PR_NOTICE("T1Tuya-Init: RLM callbacks registered");
 
     /* 7. the two "observer" callbacks are registered on their own interfaces
      *    and are not part of the callback table of step 8 */
