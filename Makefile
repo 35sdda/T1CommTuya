@@ -27,13 +27,12 @@ LINKFLAGS += -L$(TOOLCHAIN_SYSROOT)/usr/lib/aarch64-linux-gnu
 LINKFLAGS += -Wl,--start-group \
               -ldbus-1 -lbluetooth -lglib-2.0 -lgio-2.0 -lgmodule-2.0 -lgobject-2.0 \
               -lpcre -lpcre2-8 -lmount -lblkid -luuid -lselinux -lffi -lz \
-              -lsystemd -llzma -llz4 -lzstd -lcap -lgcrypt -lgpg-error -lcurl -lmosquitto \
+              -lsystemd -llzma -llz4 -lzstd -lcap -lgcrypt -lgpg-error \
               -Wl,--end-group
 
 # The objects are C++ but the final link runs through $(CC); keep libstdc++ last.
 LINKFLAGS += -lstdc++
 
-LINKFLAGS += -Wl,-rpath-link,$(TOOLCHAIN_SYSROOT)/usr/lib/aarch64-linux-gnu
 all: app_excute
 
 app_excute:
