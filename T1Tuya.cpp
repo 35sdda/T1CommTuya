@@ -42,6 +42,7 @@ extern "C" {
 #include "tuya_cloud_com_defs.h"
 #include "tuya_cloud_wifi_defs.h"
 #include "tuya_iot_com_api.h"
+#include "mqc_app.h"
 #include "tuya_iot_wifi_api.h"
 #include "tuya_wifi_netcfg.h"
 #include "tuya_wifi_reset.h"
@@ -70,7 +71,7 @@ extern "C" {
 #endif
 
 #ifndef T1_TUYA_SW_VER
-#define T1_TUYA_SW_VER          "1.0.0"
+#define T1_TUYA_SW_VER          "0.10.65"
 #endif
 
 #ifndef T1_TUYA_UUID
@@ -90,9 +91,8 @@ extern "C" {
 #define T1_TUYA_LOG_PATH        "/app/TheOne/tuya_x3m/log/"
 
 /* OTA package staging: downloaded as *.tmp, renamed on success only */
-#define T1_TUYA_OTA_DIR         "/app/TheOne/tuya_x3m/"
+#define T1_TUYA_OTA_DIR         "/app/TheOne/Ver/"
 #define T1_TUYA_OTA_TMP         T1_TUYA_OTA_DIR "ota_package.zip.tmp"
-#define T1_TUYA_OTA_FINAL       T1_TUYA_OTA_DIR "ota_package.zip"
 
 /* Used when the primary storage path is not writable (dev board without the
  * /app partition, or a root owned directory) */
@@ -441,6 +441,10 @@ static int T1Tuya_SendToDevice(const char *frame)
 #define DP_ID_MOW_DIRECTION     114     /* mowing direction settings, raw 4 bytes, rw */
 #define DP_ID_REMOTE_CONTROL    117     /* remote control bitmap, raw 1 byte, rw */
 #define DP_ID_WORK_SPEED        120     /* work speed, value 0-5, 1-4 currently valid */
+#define DP_ID_MOWING_CONTROL    121     /* mowing control, value 0 stop/1 start/2 pause/3 continue */
+#define DP_ID_RETURN_TO_CHARGE  123     /* return to charging station, bool pulse */
+#define DP_ID_RESUME_MOWING     124     /* resume mowing from saved point, bool pulse */
+#define DP_ID_MAPPING_CONTROL   125     /* mapping control, value 0 start/1 stop and save */
 #define DP_ID_ERROR_REPORT_V2   150     /* error report v2, raw 10 x 8 bytes, pushed in real time */
 
 /* Same values as the SDK PROP_xxx (tuya_cloud_com_defs.h:258-262) */
@@ -473,6 +477,10 @@ static const T1DpDesc s_dpTable[] = {
     { DP_ID_MOW_DIRECTION,   DP_KIND_RAW,   1, "mow direction"       },
     { DP_ID_REMOTE_CONTROL,  DP_KIND_RAW,   1, "remote control"      },
     { DP_ID_WORK_SPEED,      DP_KIND_VALUE, 1, "work speed"          },
+    { DP_ID_MOWING_CONTROL,  DP_KIND_VALUE, 1, "mowing control"      },
+    { DP_ID_RETURN_TO_CHARGE,DP_KIND_BOOL,  1, "return to charge"    },
+    { DP_ID_RESUME_MOWING,   DP_KIND_BOOL,  1, "resume mowing"       },
+    { DP_ID_MAPPING_CONTROL, DP_KIND_VALUE, 1, "mapping control"     },
     { DP_ID_ERROR_REPORT_V2, DP_KIND_RAW,   0, "error report v2"     },
 };
 
@@ -511,11 +519,103 @@ static void T1Tuya_DumpDpTable(void)
     }
 }
 
+/* execute DP121 mowing control and report the accepted value
+ * value = 0 stop / 1 start / 2 pause / 3 continue
+ * return:  0, command queued and reported;   -1, invalid value or send failed
+ * 2026.09.24: created by Lff（+AI）
+ */
+static int T1Tuya_OnMowingControl(int value)
+{
+    int debug=1;
+    char command='\0';
+    char frame[32];
+
+    switch ( value ) {
+    case 0:
+        command='0';
+        break;
+    case 1:
+        command='3';
+        break;
+    case 2:
+        /* T1act currently uses one toggle command for pause and resume. */
+        command='p';
+        break;
+    case 3:
+        /* T1act currently uses one toggle command for pause and resume. */
+        command='p';
+        break;
+    default:
+        if ( debug>0 ) printf("T1Tuya-OnMowingControl: invalid value=%d\n", value);
+        return -1;
+    }
+
+    snprintf(frame, sizeof(frame), "$C:%c\r\n", command);
+    if ( T1Tuya_SendToDevice(frame)!=0 ) return -1;
+    return T1Tuya_ReportDpValue(DP_ID_MOWING_CONTROL, value);
+}
+
+/* execute DP123 return-to-charge pulse and reset the cloud value to false
+ * value = bool 0/1
+ * return:  0, accepted and reported;   -1, invalid value or send failed
+ * 2026.09.24: created by Lff（+AI）
+ */
+static int T1Tuya_OnReturnToCharge(int value)
+{
+    int debug=1;
+
+    if ( value<0 || value>1 ) {
+        if ( debug>0 ) printf("T1Tuya-OnReturnToCharge: invalid value=%d\n", value);
+        return -1;
+    }
+    if ( value && T1Tuya_SendToDevice("$C:h\r\n")!=0 ) return -1;
+    return T1Tuya_ReportDpBool(DP_ID_RETURN_TO_CHARGE, 0);
+}
+
+/* execute DP124 resume-mowing pulse and reset the cloud value to false
+ * value = bool 0/1
+ * return:  0, accepted and reported;   -1, invalid value or send failed
+ * 2026.09.24: created by Lff（+AI）
+ */
+static int T1Tuya_OnResumeMowing(int value)
+{
+    int debug=1;
+
+    if ( value<0 || value>1 ) {
+        if ( debug>0 ) printf("T1Tuya-OnResumeMowing: invalid value=%d\n", value);
+        return -1;
+    }
+    if ( value && T1Tuya_SendToDevice("$C:f\r\n")!=0 ) return -1;
+    return T1Tuya_ReportDpBool(DP_ID_RESUME_MOWING, 0);
+}
+
+/* execute DP125 mapping control and report the accepted value
+ * value = 0 start mapping / 1 stop and save
+ * return:  0, command queued and reported;   -1, invalid value or send failed
+ * 2026.09.24: created by Lff（+AI）
+ */
+static int T1Tuya_OnMappingControl(int value)
+{
+    int debug=1;
+
+    if ( value<0 || value>1 ) {
+        if ( debug>0 ) printf("T1Tuya-OnMappingControl: invalid value=%d\n", value);
+        return -1;
+    }
+
+    /* T1act currently uses 't' to toggle mapping. The App must send values
+     * only for valid state transitions. */
+    if ( T1Tuya_SendToDevice("$C:t\r\n")!=0 ) return -1;
+    return T1Tuya_ReportDpValue(DP_ID_MAPPING_CONTROL, value);
+}
+
 /* cloud -> device: handle one bool/value/enum DP
  * dpid  = function point id
  * kind  = DP_KIND_BOOL / DP_KIND_VALUE (the SDK PROP_BOOL / PROP_VALUE)
  * value = bool as 0/1, value as integer
  * return:  0, handled or explicitly ignored;   -1, unknown dpid
+ * 2026.09.24: modified by Lff（+AI）, add DP121/123/124/125 and remove
+ *             the obsolete DP107 mowing action
  * 2026.09.23: modified by Lff（+AI）, execute DP107 and forward DP120
  * 2026.09.21: moved from T1DpMap.cpp by Lff（+AI）
  */
@@ -569,6 +669,7 @@ static int T1Tuya_OnObjDp(unsigned char dpid, int kind, int value)
     case DP_ID_RAIN_RESUME:
     case DP_ID_RAIN_DELAY:
     case DP_ID_EDGE_DISTANCE:
+    case DP_ID_RANDOM_MOW:
     case DP_ID_HEDGEHOG_GUARD:
     case DP_ID_RANDOM_MODE:
         /* TODO: these write a configuration item, mapping it to a device
@@ -580,11 +681,6 @@ static int T1Tuya_OnObjDp(unsigned char dpid, int kind, int value)
         }
         break;
 
-    case DP_ID_RANDOM_MOW:
-        snprintf(frame, sizeof(frame), "$C:%c\r\n", value ? '3' : '0');
-        if ( T1Tuya_SendToDevice(frame)!=0 ) return -1;
-        return T1Tuya_ReportDpBool(DP_ID_RANDOM_MOW, value ? 1 : 0);
-
     case DP_ID_WORK_SPEED:
         if ( value<0 || value>5 ) {
             if ( debug>0 ) {
@@ -595,6 +691,18 @@ static int T1Tuya_OnObjDp(unsigned char dpid, int kind, int value)
         snprintf(frame, sizeof(frame), "$X:WORK_SPEED,%d\r\n", value);
         if ( T1Tuya_SendToDevice(frame)!=0 ) return -1;
         return T1Tuya_ReportDpValue(DP_ID_WORK_SPEED, value);
+
+    case DP_ID_MOWING_CONTROL:
+        return T1Tuya_OnMowingControl(value);
+
+    case DP_ID_RETURN_TO_CHARGE:
+        return T1Tuya_OnReturnToCharge(value);
+
+    case DP_ID_RESUME_MOWING:
+        return T1Tuya_OnResumeMowing(value);
+
+    case DP_ID_MAPPING_CONTROL:
+        return T1Tuya_OnMappingControl(value);
 
     default:
         if ( debug>0 ) printf("T1Tuya-OnObjDp: unknown dpid=%u, ignore\n", dpid);
@@ -1028,6 +1136,36 @@ static int T1Tuya_OnMoveDir(int dir)
 /* file handle of the package being downloaded, one download at a time */
 static FILE *s_otaFp = NULL;
 
+/* build the company OTA package name from the cloud firmware version
+ * version = numeric three-part version from fw->sw_ver, for example 0.10.66
+ * path/path_size = output buffer and its capacity
+ * return:  0 on success;   -1 when the version or output buffer is invalid
+ * 2026.09.24: created by Lff（+AI）
+ */
+static int T1Tuya_BuildOtaFinalPath(const char *version, char *path, size_t path_size)
+{
+    size_t i=0;
+    int dot_count=0;
+    int written=0;
+
+    if ( !version || !path || path_size==0 || version[0]=='\0' ) return -1;
+
+    for ( i=0; version[i]!='\0'; i++ ) {
+        if ( version[i]>='0' && version[i]<='9' ) continue;
+        if ( version[i]=='.' && i>0 && version[i-1]!='.' ) {
+            dot_count++;
+            continue;
+        }
+        return -1;
+    }
+
+    if ( dot_count!=2 || version[i-1]=='.' ) return -1;
+
+    written=snprintf(path, path_size, "%sUpdateV%s.zip", T1_TUYA_OTA_DIR, version);
+    if ( written<0 || (size_t)written>=path_size ) return -1;
+    return 0;
+}
+
 /* pre check before an upgrade starts: refuse when the disk is too small
  * fw = firmware info from the cloud
  * return:  OPRT_OK to allow the upgrade, otherwise a tuya_error_code.h value
@@ -1134,6 +1272,7 @@ static OPERATE_RET __ota_upgrade_notify_cb(IN CONST FW_UG_S *fw, IN CONST INT_T 
 {
     INT_T report_result=TUS_UPGRD_EXEC;
     OPERATE_RET rt=OPRT_OK;
+    char final_path[256]={0};
 
     TAL_PR_NOTICE("T1Tuya-OtaNotify: result=%d", download_result);
     if ( fw ) {
@@ -1147,10 +1286,14 @@ static OPERATE_RET __ota_upgrade_notify_cb(IN CONST FW_UG_S *fw, IN CONST INT_T 
     }
 
     if ( download_result==0 ) {
-        if ( rename(T1_TUYA_OTA_TMP, T1_TUYA_OTA_FINAL)!=0 ) {
+        if ( !fw || T1Tuya_BuildOtaFinalPath(fw->sw_ver, final_path,
+                                             sizeof(final_path))!=0 ) {
+            TAL_PR_ERR("T1Tuya-OtaNotify: invalid firmware version");
+            unlink(T1_TUYA_OTA_TMP);
+        } else if ( rename(T1_TUYA_OTA_TMP, final_path)!=0 ) {
             TAL_PR_ERR("T1Tuya-OtaNotify: rename failed: %s", strerror(errno));
         } else {
-            TAL_PR_NOTICE("T1Tuya-OtaNotify: package ready: %s", T1_TUYA_OTA_FINAL);
+            TAL_PR_NOTICE("T1Tuya-OtaNotify: package ready: %s", final_path);
             report_result=TUS_UPGRD_FINI;
         }
     } else {
@@ -1522,6 +1665,32 @@ static VOID_T __dev_obj_dp_cb(IN CONST TY_RECV_OBJ_DP_S *dp)
     }
 }
 
+/* cloud -> device: receive Tuya custom application protocol 64.
+ * Protocol 65 is the opposite direction: device -> cloud.
+ * root_json belongs to the SDK; this callback must not delete it.
+ */
+static OPERATE_RET __custom_protocol_rx_cb(IN ty_cJSON *root_json)
+{
+    CHAR_T *json_text=NULL;
+
+    if ( !root_json ) {
+        TAL_PR_ERR("T1Tuya-CustomProtocol: root_json is null");
+        return OPRT_INVALID_PARM;
+    }
+
+    json_text=ty_cJSON_PrintUnformatted(root_json);
+    if ( !json_text ) {
+        TAL_PR_ERR("T1Tuya-CustomProtocol: serialize JSON failed");
+        return OPRT_MALLOC_FAILED;
+    }
+
+    TAL_PR_NOTICE("T1Tuya-CustomProtocol: protocol=%u payload=%s",
+                  PRO_MQ_APP_PROTOCOL_RX, json_text);
+    ty_cJSON_free(json_text);
+
+    return OPRT_OK;
+}
+
 /* cloud -> device: handle one raw DP downlink (map content, big blocks)
  * dp = TY_RECV_RAW_DP_S, dp->data is NOT NUL terminated, always use dp->len
  * 2026.09.20: created by Lff（+AI）, add function header comment
@@ -1645,6 +1814,15 @@ int T1Tuya::Init()
         return -1;
     }
     TAL_PR_NOTICE("T1Tuya-Init: tuya iot init ok");
+
+    rt=mqc_app_register_cb(PRO_MQ_APP_PROTOCOL_RX,
+                           __custom_protocol_rx_cb);
+    if ( rt!=OPRT_OK ) {
+        TAL_PR_ERR("T1Tuya-Init: custom protocol callback register failed: %d",
+                   rt);
+        return -1;
+    }
+    TAL_PR_NOTICE("T1Tuya-Init: custom protocol RX callback registered");
 
     /* 6. device identity, written once and reused on every later boot */
     if ( __set_auth_info()!=OPRT_OK ) {
