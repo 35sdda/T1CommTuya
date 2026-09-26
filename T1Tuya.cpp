@@ -74,6 +74,11 @@ extern "C" {
 #define T1_TUYA_SW_VER          "0.10.65"
 #endif
 
+#define T1_TUYA_VERSION_FILE    "/app/TheOne/Ver/Version"
+#define T1_TUYA_OTA_PENDING     "/app/TheOne/Ver/ota_pending"
+#define T1_TUYA_OTA_SUCCESS     "/app/TheOne/Ver/ota_success"
+#define T1_TUYA_VERSION_SIZE    32
+
 #ifndef T1_TUYA_UUID
 #define T1_TUYA_UUID            "uuidfbc9b28086ee2c9a"
 #endif
@@ -125,6 +130,7 @@ extern "C" {
 
 static char s_storagePath[128] = T1_TUYA_STORAGE_PATH;
 static char s_logPath[128]     = T1_TUYA_LOG_PATH;
+static char s_softwareVersion[T1_TUYA_VERSION_SIZE]=T1_TUYA_SW_VER;
 
 /* make sure a directory exists and can really be written by this process
  * dir  = directory path
@@ -1136,6 +1142,134 @@ static int T1Tuya_OnMoveDir(int dir)
 /* file handle of the package being downloaded, one download at a time */
 static FILE *s_otaFp = NULL;
 
+/* accept only the three-part numeric version format shared by the cloud,
+ * Version file and the1Update package name, for example 0.10.66
+ * return:  true when version is exactly numeric.numeric.numeric
+ */
+static bool T1Tuya_IsValidVersion(const char *version)
+{
+    size_t i=0;
+    int dotCount=0;
+
+    if ( !version || version[0]=='\0' ) return false;
+
+    for ( i=0; version[i]!='\0'; i++ ) {
+        if ( version[i]>='0' && version[i]<='9' ) continue;
+        if ( version[i]=='.' && i>0 && version[i-1]!='.' ) {
+            dotCount++;
+            continue;
+        }
+        return false;
+    }
+
+    return dotCount==2 && version[i-1]!='.';
+}
+
+/* read the version written by the1Update; keep the compiled version as a
+ * fallback so a missing/corrupt Version file cannot disable the Tuya channel
+ */
+static void T1Tuya_LoadSoftwareVersion(void)
+{
+    FILE *fp=fopen(T1_TUYA_VERSION_FILE, "r");
+    char version[T1_TUYA_VERSION_SIZE]={0};
+
+    if ( !fp ) {
+        TAL_PR_WARN("T1Tuya-Version: read %s failed, fallback=%s",
+                    T1_TUYA_VERSION_FILE, s_softwareVersion);
+        return;
+    }
+    if ( !fgets(version, sizeof(version), fp) ) {
+        fclose(fp);
+        TAL_PR_WARN("T1Tuya-Version: empty version file, fallback=%s",
+                    s_softwareVersion);
+        return;
+    }
+    fclose(fp);
+    version[strcspn(version, "\r\n")]='\0';
+
+    if ( !T1Tuya_IsValidVersion(version) ) {
+        TAL_PR_WARN("T1Tuya-Version: invalid version [%s], fallback=%s",
+                    version, s_softwareVersion);
+        return;
+    }
+
+    snprintf(s_softwareVersion, sizeof(s_softwareVersion), "%s", version);
+    TAL_PR_NOTICE("T1Tuya-Version: use software version %s", s_softwareVersion);
+}
+
+/* persist the cloud target before the running process exits for installation;
+ * the restarted Tuya process uses it to correlate the updater success marker
+ */
+static int T1Tuya_WritePendingVersion(const char *version)
+{
+    FILE *fp=NULL;
+
+    if ( !T1Tuya_IsValidVersion(version) ) return -1;
+    unlink(T1_TUYA_OTA_SUCCESS);
+    fp=fopen(T1_TUYA_OTA_PENDING, "w");
+    if ( !fp ) return -1;
+    if ( fprintf(fp, "%s", version)<=0 ) {
+        fclose(fp);
+        unlink(T1_TUYA_OTA_PENDING);
+        return -1;
+    }
+    if ( fclose(fp)!=0 ) {
+        unlink(T1_TUYA_OTA_PENDING);
+        return -1;
+    }
+    return 0;
+}
+
+/* read one version marker and reject truncated or malformed contents
+ * return:  0 with version filled;   -1 when the marker is absent/invalid
+ */
+static int T1Tuya_ReadVersionMarker(const char *path, char *version, size_t size)
+{
+    FILE *fp=NULL;
+
+    if ( !path || !version || size==0 ) return -1;
+    fp=fopen(path, "r");
+    if ( !fp ) return -1;
+    if ( !fgets(version, size, fp) ) {
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+    version[strcspn(version, "\r\n")]='\0';
+    return T1Tuya_IsValidVersion(version) ? 0 : -1;
+}
+
+/* report installation success only from the restarted process and only after
+ * the updater target, current Version and pending cloud target all agree
+ */
+static void T1Tuya_ReportOtaSuccess(void)
+{
+    char pending[T1_TUYA_VERSION_SIZE]={0};
+    char success[T1_TUYA_VERSION_SIZE]={0};
+    OPERATE_RET rt=OPRT_OK;
+
+    if ( T1Tuya_ReadVersionMarker(T1_TUYA_OTA_PENDING, pending,
+                                  sizeof(pending))!=0 ) return;
+    if ( T1Tuya_ReadVersionMarker(T1_TUYA_OTA_SUCCESS, success,
+                                  sizeof(success))!=0 ) return;
+    if ( strcmp(pending, success)!=0 || strcmp(success, s_softwareVersion)!=0 ) {
+        TAL_PR_WARN("T1Tuya-OtaResult: version mismatch pending=%s success=%s current=%s",
+                    pending, success, s_softwareVersion);
+        return;
+    }
+
+    rt=tuya_iot_dev_upgd_progress_rept(100, NULL, DEV_NM_ATH_SNGL);
+    if ( rt!=OPRT_OK ) return;
+    rt=tuya_iot_dev_upgd_result_report(NULL, DEV_NM_ATH_SNGL,
+                                       TUS_UPGRD_FINI);
+    if ( rt!=OPRT_OK ) return;
+
+    unlink(T1_TUYA_OTA_SUCCESS);
+    unlink(T1_TUYA_OTA_PENDING);
+    TAL_PR_NOTICE("T1Tuya-OtaResult: installation %s reported successfully",
+                  success);
+}
+
 /* build the company OTA package name from the cloud firmware version
  * version = numeric three-part version from fw->sw_ver, for example 0.10.66
  * path/path_size = output buffer and its capacity
@@ -1144,22 +1278,9 @@ static FILE *s_otaFp = NULL;
  */
 static int T1Tuya_BuildOtaFinalPath(const char *version, char *path, size_t path_size)
 {
-    size_t i=0;
-    int dot_count=0;
     int written=0;
 
-    if ( !version || !path || path_size==0 || version[0]=='\0' ) return -1;
-
-    for ( i=0; version[i]!='\0'; i++ ) {
-        if ( version[i]>='0' && version[i]<='9' ) continue;
-        if ( version[i]=='.' && i>0 && version[i-1]!='.' ) {
-            dot_count++;
-            continue;
-        }
-        return -1;
-    }
-
-    if ( dot_count!=2 || version[i-1]=='.' ) return -1;
+    if ( !path || path_size==0 || !T1Tuya_IsValidVersion(version) ) return -1;
 
     written=snprintf(path, path_size, "%sUpdateV%s.zip", T1_TUYA_OTA_DIR, version);
     if ( written<0 || (size_t)written>=path_size ) return -1;
@@ -1273,6 +1394,7 @@ static OPERATE_RET __ota_upgrade_notify_cb(IN CONST FW_UG_S *fw, IN CONST INT_T 
     INT_T report_result=TUS_UPGRD_EXEC;
     OPERATE_RET rt=OPRT_OK;
     char final_path[256]={0};
+    bool installReady=false;
 
     TAL_PR_NOTICE("T1Tuya-OtaNotify: result=%d", download_result);
     if ( fw ) {
@@ -1292,9 +1414,13 @@ static OPERATE_RET __ota_upgrade_notify_cb(IN CONST FW_UG_S *fw, IN CONST INT_T 
             unlink(T1_TUYA_OTA_TMP);
         } else if ( rename(T1_TUYA_OTA_TMP, final_path)!=0 ) {
             TAL_PR_ERR("T1Tuya-OtaNotify: rename failed: %s", strerror(errno));
+        } else if ( T1Tuya_WritePendingVersion(fw->sw_ver)!=0 ) {
+            TAL_PR_ERR("T1Tuya-OtaNotify: write pending version failed: %s",
+                       strerror(errno));
         } else {
             TAL_PR_NOTICE("T1Tuya-OtaNotify: package ready: %s", final_path);
-            report_result=TUS_UPGRD_FINI;
+            report_result=TUS_DOWNLOAD_COMPLETE;
+            installReady=true;
         }
     } else {
         TAL_PR_ERR("T1Tuya-OtaNotify: download failed, remove tmp");
@@ -1307,6 +1433,19 @@ static OPERATE_RET __ota_upgrade_notify_cb(IN CONST FW_UG_S *fw, IN CONST INT_T 
 
     rt=tuya_iot_dev_upgd_result_report(NULL, DEV_NM_ATH_SNGL, report_result);
     TAL_PR_NOTICE("T1Tuya-OtaNotify: report result %d ret=%d", report_result, rt);
+
+    if ( installReady ) {
+        rt=tuya_iot_dev_upgd_result_report(NULL, DEV_NM_ATH_SNGL,
+                                           TUS_UPGRADE_START);
+        TAL_PR_NOTICE("T1Tuya-OtaNotify: report upgrade start ret=%d", rt);
+        if ( T1Tuya_SendToDevice("$u")!=0 ) {
+            TAL_PR_ERR("T1Tuya-OtaNotify: failed to request local upgrade");
+            tuya_iot_dev_upgd_result_report(NULL, DEV_NM_ATH_SNGL,
+                                             TUS_UPGRD_EXEC);
+        } else {
+            TAL_PR_NOTICE("T1Tuya-OtaNotify: local upgrade requested");
+        }
+    }
 
     return OPRT_OK;
 }
@@ -1881,10 +2020,11 @@ int T1Tuya::Init()
 
     /* 11. the point of no return: "this process is the SOC device itself".
      *     From here on the SDK owns the wifi interface and the cloud link. */
+    T1Tuya_LoadSoftwareVersion();
     rt=tuya_iot_wf_soc_dev_init_param(GWCM_OLD, WF_START_SMART_ONLY, &iot_cbs,
                                       (CHAR_T *)T1_TUYA_FIRMWARE_KEY,
                                       (CHAR_T *)T1_TUYA_PRODUCT_KEY,
-                                      (CHAR_T *)T1_TUYA_SW_VER);
+                                      (CHAR_T *)s_softwareVersion);
     if ( rt!=OPRT_OK ) {
         TAL_PR_ERR("T1Tuya-Init: wf_soc_dev_init_param failed: %d", rt);
         return -1;
@@ -1926,9 +2066,14 @@ int T1Tuya::Select()
     int debug=1;
     static int tick=0;
 
+    tick++;
+    if ( tick%100==0 ) {
+        T1Tuya_ReportOtaSuccess();
+    }
+
     /* the BLE service state is worth a line every 500 rounds: it is the
      * quickest hint on whether netcfg is still running */
-    if ( ++tick>=500 ) {
+    if ( tick>=500 ) {
         tick=0;
         if ( debug>0 ) {
             printf("T1Tuya-Select: ble serv stat=%d (0=OPENED,1=OPENING,2=CLOSED,3=CLOSING)\n",
