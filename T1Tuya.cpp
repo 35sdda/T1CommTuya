@@ -35,6 +35,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <mqueue.h>
+#include <stdint.h>
+#include <time.h>
+#include <mutex>
 
 /* The Tuya SDK is plain C, its headers need C linkage */
 extern "C" {
@@ -52,6 +55,10 @@ extern "C" {
 #include "tal_log.h"
 #include "tuya_error_code.h"
 #include "tuya_svc_upgrade.h"
+#include "tuya_devos_utils.h"
+#include "ty_rlm_api.h"
+#include "ty_rlm_func.h"
+#include "tuya_ipc_stream_storage.h"
 #include "ws_db_gw.h"
 }
 
@@ -1266,6 +1273,212 @@ static VOID_T __dev_dp_query_cb(IN CONST TY_DP_QUERY_S *dp_qry)
      * made up value would be worse than a missing one. */
 }
 
+/* Report that this product has no IPC SD storage; required by libtuyaos.a.
+ * return:  SD_STATUS_NOT_EXIST, no SD card is managed by this process
+ * 2026.09.27: created by Msa
+ */
+SD_STATUS_E tuya_ipc_sd_get_status(VOID)
+{
+    return SD_STATUS_NOT_EXIST;
+}
+
+/* Return zero IPC SD capacity because this product does not use that service.
+ * 2026.09.27: created by Msa
+ */
+VOID tuya_ipc_sd_get_capacity(UINT_T *p_total, UINT_T *p_used, UINT_T *p_free)
+{
+    if ( p_total ) *p_total=0;
+    if ( p_used ) *p_used=0;
+    if ( p_free ) *p_free=0;
+}
+
+/* Leave IPC SD unmounted because this product has no IPC SD storage.
+ * 2026.09.27: created by Msa
+ */
+VOID tuya_ipc_sd_remount(VOID)
+{
+}
+
+/* Provide the SDK's placeholder path while IPC SD storage is disabled.
+ * return:  writable placeholder path used by the SDK demo
+ * 2026.09.27: created by Msa
+ */
+CHAR_T *tuya_ipc_get_sd_mount_path(VOID)
+{
+    return (CHAR_T *)"/tmp";
+}
+
+/* Disable IPC recording because this product has no IPC SD storage.
+ * return:  SS_WRITE_MODE_NONE, do not write IPC media
+ * 2026.09.27: created by Msa
+ */
+STREAM_STORAGE_WRITE_MODE_E tuya_ipc_sd_get_mode_config(VOID)
+{
+    return SS_WRITE_MODE_NONE;
+}
+
+/* Keep only copied subscription values; the SDK owns the callback payload.
+ * 2026.09.27: created by Msa
+ */
+typedef struct {
+    bool active;
+    bool types[SUBSCRIBE_MAX];
+    int timeout_sec;
+    uint64_t start_ms;
+    uint64_t expire_ms;
+} T1RlmSubscriptionState;
+
+static T1RlmSubscriptionState s_rlmSubscription={};
+static std::mutex s_rlmSubscriptionMutex;
+static uint64_t s_rlmSubscriptionVersion=0;
+static const char *s_rlmSubscriptionTypeNames[SUBSCRIBE_MAX]={
+    "UNKNOWN", "LOCALIZATION", "BATTERY", "TASK", "PLANNED_PATH", "ERROR"
+};
+
+/* Read elapsed time without depending on the board's clock synchronization.
+ * return:  OPRT_OK, time was read;   OPRT_COM_ERROR, clock read failed
+ * 2026.09.27: created by Msa
+ */
+static OPERATE_RET T1Tuya_GetMonotonicMs(uint64_t *now_ms)
+{
+    struct timespec ts;
+    if ( !now_ms || clock_gettime(CLOCK_MONOTONIC, &ts)!=0 ) return OPRT_COM_ERROR;
+    *now_ms=(uint64_t)ts.tv_sec*1000+(uint64_t)ts.tv_nsec/1000000;
+    return OPRT_OK;
+}
+
+/* Check a copied subscription and lazily clear it after its timeout.
+ * 2026.09.27: created by Msa
+ */
+static bool T1Tuya_IsRlmSubscribed(ROBOT_SUBSCRIBE_STATUS_E type)
+{
+    uint64_t now_ms=0;
+    if ( type<=SUBSCRIBE_UNKNOWN || type>=SUBSCRIBE_MAX ) return false;
+    if ( T1Tuya_GetMonotonicMs(&now_ms)!=OPRT_OK ) return false;
+
+    std::lock_guard<std::mutex> lock(s_rlmSubscriptionMutex);
+    if ( s_rlmSubscription.active && now_ms>=s_rlmSubscription.expire_ms ) {
+        memset(&s_rlmSubscription, 0, sizeof(s_rlmSubscription));
+        s_rlmSubscriptionVersion++;
+        TAL_PR_NOTICE("T1Tuya-RLM-Subscribe: expired at monotonic_ms=%llu",
+                      (unsigned long long)now_ms);
+    }
+    return s_rlmSubscription.active && s_rlmSubscription.types[type];
+}
+
+/* Replace the saved subscription; Tuya must confirm replace versus merge.
+ * return:  version used to avoid undoing a newer request on response failure
+ * 2026.09.27: created by Msa
+ */
+static uint64_t T1Tuya_ApplySubscriptionRequest(const T1RlmSubscriptionState *next,
+                                                 T1RlmSubscriptionState *previous)
+{
+    std::lock_guard<std::mutex> lock(s_rlmSubscriptionMutex);
+    *previous=s_rlmSubscription;
+    // TODO(Tuya-confirm): confirm whether a new request replaces or merges subscriptions.
+    s_rlmSubscription=*next;
+    return ++s_rlmSubscriptionVersion;
+}
+
+/* Validate, copy and acknowledge one RLM status subscription request.
+ * param = SDK-owned RLM_SUBSCRIBE_STATUS_S, read only during this callback
+ * return:  OPRT_OK after SDK accepts the response, otherwise an error code
+ * 2026.09.27: created by Msa
+ */
+static OPERATE_RET T1Tuya_HandleRlmSubscribe(void *param)
+{
+    TAL_PR_NOTICE("T1Tuya-RLM-Subscribe: param=%p", param);
+    if ( !param ) {
+        TAL_PR_WARN("T1Tuya-RLM-Subscribe: invalid param");
+        return OPRT_INVALID_PARM;
+    }
+
+    const RLM_SUBSCRIBE_STATUS_S *req=(const RLM_SUBSCRIBE_STATUS_S *)param;
+    TAL_PR_NOTICE("T1Tuya-RLM-Subscribe: num=%d timeout_sec=%d", req->num, req->timeout_sec);
+    if ( req->num<=0 || req->num>=SUBSCRIBE_MAX || !req->Subscribe_type || req->timeout_sec<=0 ) {
+        TAL_PR_WARN("T1Tuya-RLM-Subscribe: invalid count=%d timeout=%d types=%p",
+                    req->num, req->timeout_sec, req->Subscribe_type);
+        return OPRT_INVALID_PARM;
+    }
+
+    T1RlmSubscriptionState next={};
+    for ( int i=0; i<req->num; i++ ) {
+        int type=req->Subscribe_type[i];
+        if ( type<=SUBSCRIBE_UNKNOWN || type>=SUBSCRIBE_MAX ) {
+            TAL_PR_WARN("T1Tuya-RLM-Subscribe: unsupported index=%d type=%d", i, type);
+            return OPRT_INVALID_PARM;
+        }
+        TAL_PR_NOTICE("T1Tuya-RLM-Subscribe: index=%d type=%d(%s)",
+                      i, type, s_rlmSubscriptionTypeNames[type]);
+        next.types[type]=true;
+    }
+
+    if ( T1Tuya_GetMonotonicMs(&next.start_ms)!=OPRT_OK ) {
+        TAL_PR_ERR("T1Tuya-RLM-Subscribe: monotonic clock failed: %s", strerror(errno));
+        return OPRT_COM_ERROR;
+    }
+    next.active=true;
+    next.timeout_sec=req->timeout_sec;
+    next.expire_ms=next.start_ms+(uint64_t)next.timeout_sec*1000;
+    TAL_PR_NOTICE("T1Tuya-RLM-Subscribe: state local=%d battery=%d task=%d path=%d error=%d",
+                  next.types[SUBSCRIBE_LOCALIZATION], next.types[SUBSCRIBE_BATTERY],
+                  next.types[SUBSCRIBE_TASK], next.types[SUBSCRIBE_PLANNED_PATH],
+                  next.types[SUBSCRIBE_ERROR]);
+    TAL_PR_NOTICE("T1Tuya-RLM-Subscribe: start_ms=%llu expire_ms=%llu",
+                  (unsigned long long)next.start_ms, (unsigned long long)next.expire_ms);
+
+    ROBOT_SUBSCRIBE_STATUS_E first_type=(ROBOT_SUBSCRIBE_STATUS_E)req->Subscribe_type[0];
+    T1RlmSubscriptionState previous={};
+    uint64_t version=T1Tuya_ApplySubscriptionRequest(&next, &previous);
+    RLM_SUBSCRIBE_STATUS_R res={};
+    res.status=true;
+    res.code_error.success=true;
+    /* Log the same MQTT/BLE states checked by the SDK response path, plus
+     * gateway LAN/WAN state for comparison.
+     * 2026.09.27: modified by Msa
+     */
+    TAL_PR_NOTICE("T1Tuya-RLM-Channel: rlm_mqtt=%d bt_connected=%d gw_nw=%d",
+                  tuya_rlm_get_mqtt_status(), is_bt_connected(), get_gw_nw_status());
+    OPERATE_RET rt=ty_rlm_subscribe_response(&res);
+    TAL_PR_NOTICE("T1Tuya-RLM-Subscribe-Response: status=%d success=%d sdk_ret=%d",
+                  res.status, res.code_error.success, rt);
+    if ( rt!=OPRT_OK ) {
+        std::lock_guard<std::mutex> lock(s_rlmSubscriptionMutex);
+        if ( s_rlmSubscriptionVersion==version ) {
+            s_rlmSubscription=previous;
+            s_rlmSubscriptionVersion++;
+        }
+        return rt;
+    }
+    TAL_PR_NOTICE("T1Tuya-RLM-Subscribe: first_type_active=%d",
+                  T1Tuya_IsRlmSubscribed(first_type));
+    return OPRT_OK;
+}
+
+/* Dispatch an RLM setting command after SDK decoding.
+ * cmd = SDK command ID; param = SDK-owned payload, valid during this callback
+ * return:  subscription result or OPRT_NOT_SUPPORTED for other commands
+ * 2026.09.27: created by Msa
+ * 2026.09.27: modified by Msa, handle status subscriptions
+ */
+static OPERATE_RET __rlm_set_cb(IN COMPLEX_RLM_CMD_E cmd, IN void *param)
+{
+    TAL_PR_NOTICE("T1Tuya-RlmSet: cmd=%d param=%p", (int)cmd, param);
+    if ( cmd==DEV_SUBSCRIBE_REQUEST ) return T1Tuya_HandleRlmSubscribe(param);
+    return OPRT_NOT_SUPPORTED;
+}
+
+/* Log an RLM query command after SDK decoding; response handling is added separately.
+ * cmd = SDK command ID; param = SDK-owned query payload
+ * return:  OPRT_NOT_SUPPORTED, no RLM query response is available yet
+ * 2026.09.27: created by Msa
+ */
+static OPERATE_RET __rlm_query_cb(IN COMPLEX_RLM_CMD_E cmd, IN void *param)
+{
+    TAL_PR_NOTICE("T1Tuya-RlmQuery: cmd=%d param=%p", (int)cmd, param);
+    return OPRT_NOT_SUPPORTED;
+}
+
 /* bring up the Tuya SDK: directories, identity, BLE netcfg, cloud link and the
  * DP / OTA callbacks. Every SDK call of the channel is issued from here.
  * Call order matters: this function must be called AFTER MSG_COMM_READY was
@@ -1359,6 +1572,18 @@ int T1Tuya::Init()
     }
     TAL_PR_NOTICE("T1Tuya-Init: tuya iot init ok");
 
+    /* Register RLM online/offline events before the SOC cloud link starts.
+     * This is what updates tuya_rlm_get_mqtt_status() for RLM responses.
+     * Media stays disabled on this controller-only board.
+     * 2026.09.27: modified by Msa
+     */
+    rt=ty_rlm_iot_init(false);
+    if ( rt!=OPRT_OK ) {
+        TAL_PR_ERR("T1Tuya-Init: RLM iot init failed: %d", rt);
+        return -1;
+    }
+    TAL_PR_NOTICE("T1Tuya-Init: RLM iot events registered");
+
     /* 6. device identity, written once and reused on every later boot */
     if ( __set_auth_info()!=OPRT_OK ) {
         TAL_PR_WARN("T1Tuya-Init: set auth info failed, continue anyway");
@@ -1416,6 +1641,16 @@ int T1Tuya::Init()
         return -1;
     }
     TAL_PR_NOTICE("T1Tuya-Init: wifi soc dev init ok");
+
+    /* Register RLM callbacks after SOC initialization, following the SDK demo.
+     * 2026.09.27: modified by Msa
+     */
+    rt=ty_rlm_complex_func_register(__rlm_set_cb, __rlm_query_cb);
+    if ( rt!=OPRT_OK ) {
+        TAL_PR_ERR("T1Tuya-Init: RLM callback registration failed: %d", rt);
+        return -1;
+    }
+    TAL_PR_NOTICE("T1Tuya-Init: RLM callbacks registered");
 
     /* 12. upgrade service, the download callbacks are handed over here */
     TUYA_UPGRADE_PARAM_T upgrade_param;
