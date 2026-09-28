@@ -1861,6 +1861,28 @@ static VOID_T __dev_dp_query_cb(IN CONST TY_DP_QUERY_S *dp_qry)
      * made up value would be worse than a missing one. */
 }
 
+/* Log an RLM setting command after SDK decoding; business handling is added separately.
+ * cmd = SDK command ID; param = SDK-owned payload, valid during this callback
+ * return:  OPRT_NOT_SUPPORTED, no RLM setting is executed yet
+ * 2026.09.27: created by Msa
+ */
+static OPERATE_RET __rlm_set_cb(IN COMPLEX_RLM_CMD_E cmd, IN void *param)
+{
+    TAL_PR_NOTICE("T1Tuya-RlmSet: cmd=%d param=%p", (int)cmd, param);
+    return OPRT_NOT_SUPPORTED;
+}
+
+/* Log an RLM query command after SDK decoding; response handling is added separately.
+ * cmd = SDK command ID; param = SDK-owned query payload
+ * return:  OPRT_NOT_SUPPORTED, no RLM query response is available yet
+ * 2026.09.27: created by Msa
+ */
+static OPERATE_RET __rlm_query_cb(IN COMPLEX_RLM_CMD_E cmd, IN void *param)
+{
+    TAL_PR_NOTICE("T1Tuya-RlmQuery: cmd=%d param=%p", (int)cmd, param);
+    return OPRT_NOT_SUPPORTED;
+}
+
 /* bring up the Tuya SDK: directories, identity, BLE netcfg, cloud link and the
  * DP / OTA callbacks. Every SDK call of the channel is issued from here.
  * Call order matters: this function must be called AFTER MSG_COMM_READY was
@@ -2030,6 +2052,16 @@ int T1Tuya::Init()
         return -1;
     }
     TAL_PR_NOTICE("T1Tuya-Init: wifi soc dev init ok");
+
+    /* Register RLM callbacks after SOC initialization, following the SDK demo.
+     * 2026.09.27: modified by Msa
+     */
+    rt=ty_rlm_complex_func_register(__rlm_set_cb, __rlm_query_cb);
+    if ( rt!=OPRT_OK ) {
+        TAL_PR_ERR("T1Tuya-Init: RLM callback registration failed: %d", rt);
+        return -1;
+    }
+    TAL_PR_NOTICE("T1Tuya-Init: RLM callbacks registered");
 
     /* 12. upgrade service, the download callbacks are handed over here */
     TUYA_UPGRADE_PARAM_T upgrade_param;
