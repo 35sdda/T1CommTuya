@@ -2139,15 +2139,6 @@ int T1Tuya::Init()
         TAL_PR_WARN("T1Tuya-Init: set auth info failed, continue anyway");
     }
 
-    /* 6a. register the two first RLM control requests before the cloud link
-     *     starts delivering complex protocol data */
-    rt=ty_rlm_complex_func_register(T1Tuya_RlmSetCallback, T1Tuya_RlmQueryCallback);
-    if ( rt!=OPRT_OK ) {
-        TAL_PR_ERR("T1Tuya-Init: RLM callback register failed: %d", rt);
-        return -1;
-    }
-    TAL_PR_NOTICE("T1Tuya-Init: RLM callbacks registered");
-
     /* 7. the two "observer" callbacks are registered on their own interfaces
      *    and are not part of the callback table of step 8 */
     tuya_iot_reg_get_wf_nw_stat_cb(__wf_nw_stat_cb);
