@@ -6,6 +6,14 @@ tuya/output/
 .gitattributes
 .gitignore
 TheOne.sh
+<<<<<<< Updated upstream
+高级协议清单.md
+高级协议与T1Act能力对照.md
+=======
+高级协议与T1Act能力对照.md
+.gitignore
+高级协议清单.md
+>>>>>>> Stashed changes
 # Other files and folders
 
 # Executables

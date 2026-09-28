@@ -38,6 +38,7 @@
 #include <stdint.h>
 #include <time.h>
 #include <mutex>
+#include <atomic>
 
 /* The Tuya SDK is plain C, its headers need C linkage */
 extern "C" {
@@ -137,6 +138,9 @@ extern "C" {
 static char s_storagePath[128] = T1_TUYA_STORAGE_PATH;
 static char s_logPath[128]     = T1_TUYA_LOG_PATH;
 static char s_softwareVersion[T1_TUYA_VERSION_SIZE]=T1_TUYA_SW_VER;
+/* The SDK invokes reset callbacks on its own thread; defer netcfg reinit to
+ * the communication loop to avoid re-entering the SDK from that callback. */
+static std::atomic_bool s_remoteUnbindReconfigPending(false);
 
 /* make sure a directory exists and can really be written by this process
  * dir  = directory path
@@ -1054,6 +1058,10 @@ static VOID_T __gw_status_changed_cb(IN CONST GW_STATUS_E status)
 static VOID_T __gw_reset_cb(IN CONST GW_RESET_TYPE_E type)
 {
     TAL_PR_NOTICE("T1Tuya-GwReset: type=%d", type);
+    if ( type==GW_REMOTE_UNACTIVE ) {
+        s_remoteUnbindReconfigPending.store(true);
+        TAL_PR_NOTICE("T1Tuya-GwReset: remote unbind received, schedule BLE netcfg reinit");
+    }
 }
 
 /* wifi network status, the most useful callback to tell which stage the device
@@ -1542,85 +1550,24 @@ static OPERATE_RET __set_auth_info(void)
     return rt;
 }
 
-/* settle the netcfg state of this boot: keep a usable store, reset what is not
- * usable any more to "unregistered / not configured" (the state that makes the
- * SDK open the BLE netcfg service again).
- * The reset is deliberately NOT unconditional: forcing it on every boot pushes
- * the device back into netcfg, where the SDK re-activates the wifi profile over
- * and over (measured: 6 drop/connect pairs within one boot). A cloud activation
- * request that lands inside such a drop fails with "fail to get cloud url -2050"
- * and then "activate timeout", so the device stays offline although wlan0 is
- * connected and the App reports "device not found".
- * wsm    = gateway work state from the store: netcfg mode, ssid, passwd, stat
- * bi     = device identity from the store, it carries ap_ssid/ap_passwd as well
- * stat   = UNREGISTERED 0 / REGISTERED 1 / ACTIVATED 2              (gw_intf.h)
- * nc_tp  = GWNS_*: 1/2/10 are still waiting for credentials, 3/4/5/6/7/9/12
- *          already received them                        (tuya_cloud_wifi_defs.h)
- * Force a re-provisioning (new router, changed password, device bound by someone
- * else) by wiping the store and rebooting; the device is then unbound and has to
- * be added in the App again:
- *     sudo rm -f /app/TheOne/tuya_x3m/tuya_user.db* /app/TheOne/tuya_x3m/tuya_enckey.db
- * return:  1, state was reset and written;   0, kept as is (usable store);
- *          -1, a reset was needed but the write failed
+/* force the gateway work state back to "unregistered / not configured" on every
+ * boot so that the SDK always opens the BLE netcfg service again
+ * return:  1, state was reset and written;   -1, state write failed
  * 2026.09.20: created by Lff（+AI）, add function header comment
  * 2026.09.21: modified by Lff（+AI）, reuse a usable store, repair a state that
  *             lost its credentials, reset only what is really not provisioned
+ * 2026.09.27: modified by Lff（+AI）, force netcfg again on every boot
  */
 static int __force_unregistered_wsm(void)
 {
     GW_WORK_STAT_MAG_S wsm;
-    GW_BASE_IF_S       bi;
-    OPERATE_RET rt_wsm=OPRT_OK;
-    OPERATE_RET rt_bi=OPRT_OK;
-    bool identity_ok=false;
-    bool cred_ok=false;
-    bool provisioned=false;
+    OPERATE_RET rt=OPRT_OK;
 
     memset(&wsm, 0, sizeof(wsm));
-    rt_wsm=wd_gw_wsm_read(&wsm);
-    if ( rt_wsm!=OPRT_OK ) {
-        /* no work state stored yet: a fresh store, treat it as unprovisioned */
-        TAL_PR_WARN("T1Tuya-ForceWsm: wsm read failed: %d, treat as unprovisioned", rt_wsm);
-        memset(&wsm, 0, sizeof(wsm));
+    rt=wd_gw_wsm_read(&wsm);
+    if ( rt!=OPRT_OK ) {
+        TAL_PR_WARN("T1Tuya-ForceWsm: read failed: %d, use default", rt);
     }
-
-    memset(&bi, 0, sizeof(bi));
-    rt_bi=wd_gw_base_if_read(&bi);
-    identity_ok=(rt_bi==OPRT_OK && bi.uuid[0]!='\0' && bi.auth_key[0]!='\0');
-
-    /* credentials can sit in the identity record and/or in the work state */
-    cred_ok=(bi.ap_ssid[0]!='\0') || (wsm.ssid[0]!='\0');
-
-    /* the GWNS_* values that mean "credentials already received", plus
-     * NO_NEED_CFG (wifi does not have to be configured again) */
-    provisioned=(wsm.stat!=UNREGISTERED) ||
-                (wsm.nc_tp==GWNS_TY_SMARTCFG)    || (wsm.nc_tp==GWNS_TY_AP) ||
-                (wsm.nc_tp==GWNS_WECHAT_AK)      || (wsm.nc_tp==GWNS_OTHER_CFG) ||
-                (wsm.nc_tp==GWNS_NO_NEED_CFG)    || (wsm.nc_tp==GWNS_TY_SMART_AP_CFG) ||
-                (wsm.nc_tp==GWNS_PROXY_CONFIG_WF);
-
-    if ( identity_ok && cred_ok && provisioned ) {
-        TAL_PR_NOTICE("T1Tuya-ForceWsm: usable store, keep it (stat=%d nc_tp=%d ssid=%s)",
-                      wsm.stat, wsm.nc_tp, wsm.ssid[0]!='\0' ? wsm.ssid : bi.ap_ssid);
-        return 0;
-    }
-
-    /* credentials are there but the work state lost them (for example a store
-     * that was written halfway): repair the state from the identity record
-     * instead of asking for a new provisioning run */
-    if ( identity_ok && cred_ok ) {
-        snprintf(wsm.ssid,   sizeof(wsm.ssid),   "%s", bi.ap_ssid);
-        snprintf(wsm.passwd, sizeof(wsm.passwd), "%s", bi.ap_passwd);
-        wsm.nc_tp=GWNS_NO_NEED_CFG;
-        wsm.md=GWM_NORMAL;
-        wsm.stat=REGISTERED;
-        rt_wsm=wd_gw_wsm_write(&wsm);
-        TAL_PR_NOTICE("T1Tuya-ForceWsm: state repaired from the identity record, write ret=%d", rt_wsm);
-        if ( rt_wsm==OPRT_OK ) return 0;
-    }
-
-    TAL_PR_NOTICE("T1Tuya-ForceWsm: reset to unprovisioned (identity=%d cred=%d stat=%d nc_tp=%d)",
-                  identity_ok ? 1 : 0, cred_ok ? 1 : 0, wsm.stat, wsm.nc_tp);
 
     wsm.nc_tp=GWNS_UNCFG_SMC;
     wsm.md=GWM_SPECIAL_SMT_CFG;
@@ -1628,10 +1575,10 @@ static int __force_unregistered_wsm(void)
     memset(wsm.ssid,   0, sizeof(wsm.ssid));
     memset(wsm.passwd, 0, sizeof(wsm.passwd));
 
-    rt_wsm=wd_gw_wsm_write(&wsm);
-    TAL_PR_NOTICE("T1Tuya-ForceWsm: write ret=%d stat=%d", rt_wsm, wsm.stat);
+    rt=wd_gw_wsm_write(&wsm);
+    TAL_PR_NOTICE("T1Tuya-ForceWsm: write ret=%d stat=%d", rt, wsm.stat);
 
-    return (rt_wsm==OPRT_OK) ? 1 : -1;
+    return (rt==OPRT_OK) ? 1 : -1;
 }
 
 /* ============================================================
@@ -2299,6 +2246,15 @@ int T1Tuya::Select()
 {
     int debug=1;
     static int tick=0;
+
+    if ( s_remoteUnbindReconfigPending.exchange(false) ) {
+        OPERATE_RET rt=tuya_iot_netcfg_reinit();
+        if ( rt==OPRT_OK ) {
+            TAL_PR_NOTICE("T1Tuya-Select: BLE netcfg reinit ok after remote unbind");
+        } else {
+            TAL_PR_ERR("T1Tuya-Select: BLE netcfg reinit failed after remote unbind: %d", rt);
+        }
+    }
 
     tick++;
     if ( tick%100==0 ) {
